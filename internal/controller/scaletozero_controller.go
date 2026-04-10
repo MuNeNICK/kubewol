@@ -109,11 +109,16 @@ func (r *ScaleToZeroReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 	}
 
 	ready := r.countReadyEndpoints(ctx, svc.Namespace, svc.Name)
+	proxyMode := ready == 0
 
-	// Delay proxy_mode OFF by propagationDelay to let kube-proxy update iptables/ipvs.
-	// Without this, a SYN retransmit can slip through before DNAT rules are ready,
-	// causing iptables REJECT → RST → browser ERR_NETWORK_CHANGED.
-	const propagationDelay = 5 * time.Second
+	// proxy_mode (SYN DROP) toggles immediately.
+	r.BPF.SetProxyMode(bpfKey, proxyMode, nodePort)
+
+	// rst_suppress stays ON longer than proxy_mode to cover
+	// kube-proxy iptables/ipvs propagation delay.
+	// When proxy_mode turns OFF, SYN passes through. If DNAT isn't
+	// ready yet, iptables REJECT sends RST. rst_suppress drops it.
+	const rstSuppressDelay = 5 * time.Second
 
 	r.mu.Lock()
 	prev, exists := r.watches[req.NamespacedName]
@@ -121,15 +126,14 @@ func (r *ScaleToZeroReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 	if exists {
 		readySince = prev.ReadySince
 	}
-
 	if ready == 0 {
-		readySince = time.Time{} // reset
+		readySince = time.Time{}
 	} else if readySince.IsZero() {
-		readySince = time.Now() // first ready
+		readySince = time.Now()
 	}
 
-	proxyMode := ready == 0 || time.Since(readySince) < propagationDelay
-	r.BPF.SetProxyMode(bpfKey, proxyMode, nodePort)
+	rstSuppress := ready == 0 || time.Since(readySince) < rstSuppressDelay
+	r.BPF.SetRstSuppress(bpfKey, rstSuppress, nodePort)
 
 	r.watches[req.NamespacedName] = &WatchEntry{
 		Namespace: svc.Namespace, Service: svc.Name,
@@ -142,11 +146,11 @@ func (r *ScaleToZeroReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 	logger.Info("reconciled",
 		"service", svc.Name, "clusterIP", svc.Spec.ClusterIP,
 		"port", port, "nodePort", nodePort,
-		"proxyMode", proxyMode, "readyEndpoints", ready)
+		"proxyMode", proxyMode, "rstSuppress", rstSuppress, "readyEndpoints", ready)
 
-	// If we're in the propagation delay, requeue to turn off proxy_mode after the delay.
-	if proxyMode && ready > 0 {
-		return ctrl.Result{RequeueAfter: propagationDelay}, nil
+	// Requeue to disable rst_suppress after delay
+	if rstSuppress && ready > 0 {
+		return ctrl.Result{RequeueAfter: rstSuppressDelay}, nil
 	}
 
 	return ctrl.Result{}, nil

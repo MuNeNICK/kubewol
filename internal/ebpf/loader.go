@@ -66,9 +66,9 @@ func (m *Manager) attachAll() error {
 	if ingressProg == nil {
 		return fmt.Errorf("bpf program 'traffic_monitor' not found")
 	}
-	egressProg := m.coll.Programs["rst_suppress"]
+	egressProg := m.coll.Programs["egress_rst_filter"]
 	if egressProg == nil {
-		return fmt.Errorf("bpf program 'rst_suppress' not found")
+		return fmt.Errorf("bpf program 'egress_rst_filter' not found")
 	}
 	attached := 0
 	for _, iface := range ifaces {
@@ -137,14 +137,16 @@ func (m *Manager) RemoveWatch(clusterIP net.IP, port uint16, nodePort int32) {
 	m.coll.Maps["watch_svc"].Delete(key)
 	m.coll.Maps["syn_count"].Delete(key)
 	m.coll.Maps["proxy_mode"].Delete(key)
+	m.coll.Maps["rst_suppress"].Delete(key)
 	if nodePort > 0 {
 		npKey := uint32(Htons(uint16(nodePort)))
 		m.coll.Maps["nodeport_mode"].Delete(npKey)
+		m.coll.Maps["nodeport_rst_suppress"].Delete(npKey)
 		m.coll.Maps["nodeport_to_svc"].Delete(npKey)
 	}
 }
 
-// SetProxyMode enables or disables SYN DROP for a service.
+// SetProxyMode enables or disables SYN DROP for a service (ingress).
 func (m *Manager) SetProxyMode(key SvcKey, enabled bool, nodePort int32) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -157,6 +159,23 @@ func (m *Manager) SetProxyMode(key SvcKey, enabled bool, nodePort int32) {
 	if nodePort > 0 {
 		npKey := uint32(Htons(uint16(nodePort)))
 		m.coll.Maps["nodeport_mode"].Update(npKey, val, ebpf.UpdateAny)
+	}
+}
+
+// SetRstSuppress enables or disables RST/ICMP suppression (egress).
+// This should be kept ON longer than proxy_mode to cover kube-proxy propagation delay.
+func (m *Manager) SetRstSuppress(key SvcKey, enabled bool, nodePort int32) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	var val uint8
+	if enabled {
+		val = 1
+	}
+	m.coll.Maps["rst_suppress"].Update(key, val, ebpf.UpdateAny)
+	if nodePort > 0 {
+		npKey := uint32(Htons(uint16(nodePort)))
+		m.coll.Maps["nodeport_rst_suppress"].Update(npKey, val, ebpf.UpdateAny)
 	}
 }
 

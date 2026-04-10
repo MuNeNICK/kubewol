@@ -50,7 +50,7 @@ struct {
     __type(value, __u64);
 } syn_count SEC(".maps");
 
-// Proxy mode: set by userspace when HPA ScaledToZero == True
+// Proxy mode: SYN DROP when no endpoints (ingress)
 struct {
     __uint(type, BPF_MAP_TYPE_HASH);
     __uint(max_entries, 256);
@@ -58,14 +58,30 @@ struct {
     __type(value, __u8);
 } proxy_mode SEC(".maps");
 
-// NodePort proxy mode: port-only check for RST suppression
-// key=port (network byte order, padded to u32), value=1
+// RST suppress mode: RST/ICMP DROP (egress). Kept ON slightly longer
+// than proxy_mode to cover the kube-proxy rule propagation gap.
+struct {
+    __uint(type, BPF_MAP_TYPE_HASH);
+    __uint(max_entries, 256);
+    __type(key, struct svc_key);
+    __type(value, __u8);
+} rst_suppress SEC(".maps");
+
+// NodePort proxy mode: SYN DROP (ingress)
 struct {
     __uint(type, BPF_MAP_TYPE_HASH);
     __uint(max_entries, 256);
     __type(key, __u32);
     __type(value, __u8);
 } nodeport_mode SEC(".maps");
+
+// NodePort RST suppress: RST/ICMP DROP (egress)
+struct {
+    __uint(type, BPF_MAP_TYPE_HASH);
+    __uint(max_entries, 256);
+    __type(key, __u32);
+    __type(value, __u8);
+} nodeport_rst_suppress SEC(".maps");
 
 // NodePort -> ClusterIP:port mapping for SYN counting
 // key=nodePort (network byte order, padded to u32), value=svc_key (ClusterIP:port)
@@ -186,7 +202,7 @@ int traffic_monitor(struct __sk_buff *skb)
 // the SYN after ~1s, by which time the pod is up.
 // ─────────────────────────────────────────
 SEC("tc")
-int rst_suppress(struct __sk_buff *skb)
+int egress_rst_filter(struct __sk_buff *skb)
 {
     void *data     = (void *)(long)skb->data;
     void *data_end = (void *)(long)skb->data_end;
@@ -214,21 +230,21 @@ int rst_suppress(struct __sk_buff *skb)
         if (!tcp->rst)
             return TC_ACT_OK;
 
-        // Check 1: src is ClusterIP:port (direct ClusterIP traffic)
+        // Check 1: src is ClusterIP:port
         struct svc_key key = {
             .addr = ip->saddr,
             .port = tcp->source,
             .pad  = 0,
         };
-        __u8 *pmode = bpf_map_lookup_elem(&proxy_mode, &key);
-        if (pmode && *pmode) {
+        __u8 *rs = bpf_map_lookup_elem(&rst_suppress, &key);
+        if (rs && *rs) {
             return TC_ACT_SHOT;
         }
 
         // Check 2: src port is a NodePort (reverse-NATed RST)
         __u32 sport = tcp->source;
-        __u8 *nmode = bpf_map_lookup_elem(&nodeport_mode, &sport);
-        if (nmode && *nmode) {
+        __u8 *nrs = bpf_map_lookup_elem(&nodeport_rst_suppress, &sport);
+        if (nrs && *nrs) {
             return TC_ACT_SHOT;
         }
     } else if (ip->protocol == IPPROTO_ICMP) {
@@ -261,14 +277,14 @@ int rst_suppress(struct __sk_buff *skb)
             .port = ports[1],
             .pad  = 0,
         };
-        __u8 *pmode = bpf_map_lookup_elem(&proxy_mode, &key);
-        if (pmode && *pmode) {
+        __u8 *rs = bpf_map_lookup_elem(&rst_suppress, &key);
+        if (rs && *rs) {
             return TC_ACT_SHOT;
         }
         // Check NodePort match
         __u32 dport = ports[1];
-        __u8 *nmode = bpf_map_lookup_elem(&nodeport_mode, &dport);
-        if (nmode && *nmode) {
+        __u8 *nrs = bpf_map_lookup_elem(&nodeport_rst_suppress, &dport);
+        if (nrs && *nrs) {
             return TC_ACT_SHOT;
         }
     }
