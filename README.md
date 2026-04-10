@@ -213,15 +213,15 @@ Measured on kind (K8s v1.36.0-rc.0, kernel 6.19, 2-node cluster, default HPA set
 
 ### Cold start: TCP connect time (0 replicas -> HTTP 200)
 
-```
-$ curl --connect-timeout 120 http://<node-ip>:30080/
-OK
-connect=19.7s  http_code=200    # cold start (3 runs averaged: 19.4s, 19.7s, 19.7s)
-```
+| Mode | Target | Scale API call | Total cold start |
+|---|---|---|---|
+| HPA (default) | Deployment | — | **~19.7s** |
+| direct-scale | Deployment | 24.8 ms | **~3.0s** |
+| direct-scale | StatefulSet | 9.2 ms | **~4.1s** |
 
-A single `curl` succeeds without application-level retries. The TCP connection is preserved through kernel SYN retransmit -- no reconnection, no retry logic needed.
+A single `curl` succeeds without application-level retries. The TCP connection is preserved through kernel SYN retransmit — no reconnection, no retry logic needed.
 
-### Time breakdown
+### Time breakdown (HPA mode)
 
 ```
 t=0.0s    SYN -> TC ingress DROP (conntrack clean)
@@ -237,6 +237,16 @@ t=~18s    Pod Ready -> EndpointSlice updated -> proxy_mode OFF
 t=~19s    SYN retransmit #5 -> PASS -> TCP handshake -> HTTP 200
 ```
 
+### Time breakdown (direct-scale mode)
+
+```
+t=0.0s    SYN -> TC ingress DROP + ring buffer event
+t=~0.01s  kubewol patches /scale (0->1) via K8s API  <-- bypasses HPA 15s sync
+t=1.0s    SYN retransmit #1 -> DROP (pod still starting)
+t=~2-3s   Pod Ready -> EndpointSlice updated -> proxy_mode OFF
+t=~3s     SYN retransmit #2 -> PASS -> TCP handshake -> HTTP 200
+```
+
 ### Bottlenecks
 
 | Component | Contribution | Tunable | Scope |
@@ -247,18 +257,19 @@ t=~19s    SYN retransmit #5 -> PASS -> TCP handshake -> HTTP 200
 | **Pod startup** | 3-5s | Image pre-pull, lightweight base image | Per-workload |
 | **TCP SYN retransmit** | 0-16s | Not tunable from server side | Kernel exponential backoff |
 
-The dominant bottleneck is the **HPA 15s sync period**. This is not configurable per-HPA; it is a global kube-controller-manager flag.
+In HPA mode, the dominant bottleneck is the **HPA 15s sync period**. This is not configurable per-HPA; it is a global kube-controller-manager flag. **direct-scale mode bypasses this entirely** and is ~6x faster.
 
 ### Tuning guide
 
 | Optimization | Cold start reduction |
 |---|---|
-| Enable Remote Write (`--remote-write-url`) | Eliminates scrape interval wait |
-| `--metrics-relist-interval=10s` on Adapter | -20s worst case |
-| `--horizontal-pod-autoscaler-sync-period=5s` | -10s worst case |
-| Pre-pull workload images | -2-3s |
+| **`kubewol/direct-scale=true`** | **-16s (19.7s → 3s)** |
+| Enable Remote Write (`--remote-write-url`) | Eliminates scrape interval wait (HPA mode) |
+| `--metrics-relist-interval=10s` on Adapter | -20s worst case (HPA mode) |
+| `--horizontal-pod-autoscaler-sync-period=5s` | -10s worst case (HPA mode) |
+| Pre-pull workload images | -1-2s |
 | Static binary / distroless base | -1-2s |
-| **All combined** | **~10s cold start** |
+| **direct-scale + tuned Pod** | **~1-2s cold start** |
 
 ### Limitations
 
