@@ -182,6 +182,59 @@ External (not part of kubewol):
   Prometheus -> Prometheus Adapter -> HPA
 ```
 
+## Performance
+
+Measured on kind (K8s v1.36.0-rc.0, kernel 6.19, 2-node cluster) with a Python HTTP server as the workload.
+
+### Cold start: TCP connect time (0 replicas -> HTTP 200)
+
+| Configuration | Connect time | Notes |
+|---|---|---|
+| Prometheus + Remote Write | **19.4s** | SYN detection -> Remote Write push -> Adapter -> HPA -> Pod Ready |
+| External Metrics API (direct) | **19.6s** | Same pipeline without Prometheus, no meaningful difference |
+
+A single `curl --connect-timeout 120` succeeds without application-level retries. The TCP connection is preserved through SYN retransmit.
+
+### Time breakdown
+
+```
+t=0s      SYN -> TC ingress DROP (0ms)
+t=1-15s   TCP SYN retransmits (1s, 3s, 7s, 15s exponential backoff)
+t=~1s     Remote Write pushes metric to Prometheus
+t=~5s     Prometheus Adapter picks up metric
+t=~15s    HPA evaluates and scales 0->N (sync period: 15s)
+t=~18s    Pod scheduled + container started + readiness probe passed
+t=~18s    EndpointSlice updated -> proxy_mode OFF
+t=~19s    Next SYN retransmit passes through -> TCP handshake completes
+```
+
+### Bottlenecks
+
+| Component | Latency | Tunable | Impact |
+|---|---|---|---|
+| **HPA sync period** | up to 15s | `--horizontal-pod-autoscaler-sync-period` on kube-controller-manager | Cluster-wide, affects all HPAs |
+| **Prometheus Adapter relist** | up to 30s | `--metrics-relist-interval` on Prometheus Adapter | Can reduce to 10s |
+| **Prometheus scrape interval** | up to 60s | `scrape_interval` in Prometheus config | **Bypassed by Remote Write** |
+| **Pod startup** | 3-5s | Image pre-pull, lightweight base image, startup probe tuning | Per-workload |
+| **TCP SYN retransmit** | 0-16s | Not tunable from server side | Kernel exponential backoff (1, 2, 4, 8, 16s) |
+
+### Reducing cold start time
+
+| Optimization | Expected improvement |
+|---|---|
+| Enable Remote Write (`--remote-write-url`) | Eliminates scrape interval wait |
+| Reduce Adapter relist to 10s | -20s worst case |
+| Reduce HPA sync to 5s | -10s worst case |
+| Pre-pull workload images | -2-3s |
+| Use distroless/static binary | -1-2s |
+| **All combined** | **~10s cold start** |
+
+### What kubewol cannot improve
+
+- **HPA evaluation frequency**: Controlled by kube-controller-manager, not per-HPA configurable
+- **TCP retransmit backoff**: Kernel-level, not configurable from the server side. After Pod is ready, the client must wait for its next scheduled SYN retransmit
+- **kube-proxy endpoint propagation**: iptables/ipvs rule update after EndpointSlice change
+
 ## Uninstall
 
 ```bash
