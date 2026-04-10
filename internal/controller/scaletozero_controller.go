@@ -134,6 +134,9 @@ func (r *ScaleToZeroReconciler) removeWatch(name types.NamespacedName) {
 	}
 }
 
+// countReadyEndpoints returns the number of endpoints that are ready AND not terminating.
+// During scale-down, endpoints briefly appear as ready=false + terminating=true.
+// We must not disable proxy_mode until there are stable, non-terminating ready endpoints.
 func (r *ScaleToZeroReconciler) countReadyEndpoints(ctx context.Context, ns, svcName string) int {
 	var list discoveryv1.EndpointSliceList
 	if err := r.List(ctx, &list, client.InNamespace(ns),
@@ -143,7 +146,9 @@ func (r *ScaleToZeroReconciler) countReadyEndpoints(ctx context.Context, ns, svc
 	n := 0
 	for _, eps := range list.Items {
 		for _, ep := range eps.Endpoints {
-			if ep.Conditions.Ready != nil && *ep.Conditions.Ready {
+			ready := ep.Conditions.Ready != nil && *ep.Conditions.Ready
+			terminating := ep.Conditions.Terminating != nil && *ep.Conditions.Terminating
+			if ready && !terminating {
 				n += len(ep.Addresses)
 			}
 		}
