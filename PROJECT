@@ -8,14 +8,4 @@ layout:
 - go.kubebuilder.io/v4
 projectName: kubewol
 repo: github.com/munenick/kubewol
-resources:
-- api:
-    crdVersion: v1
-    namespaced: true
-  controller: true
-  domain: munenick.dev
-  group: ebpf
-  kind: ScaleToZero
-  path: github.com/munenick/kubewol/api/v1alpha1
-  version: v1alpha1
 version: "3"
