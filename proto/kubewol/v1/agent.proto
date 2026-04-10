@@ -1,0 +1,57 @@
+syntax = "proto3";
+
+package kubewol.v1;
+
+option go_package = "github.com/munenick/kubewol/internal/agentapi/pb;pb";
+
+// Agent is the gRPC surface served by the kubewol agent DaemonSet. The
+// controller Deployment is the only expected caller; authentication is
+// enforced by a unary/stream interceptor that validates the bearer token in
+// the "authorization" metadata against kube-apiserver via TokenReview with
+// spec.audiences=["kubewol.io/agent-api"]. Any token whose aud claim does
+// not match that audience is rejected before reaching a handler.
+service Agent {
+  // PutWatches replaces the agent's full desired watch state. The
+  // controller sends the complete set on every reconcile; the agent diffs
+  // against its in-memory snapshot and updates BPF maps accordingly.
+  rpc PutWatches(WatchSpec) returns (PutWatchesResponse);
+
+  // SubscribeSynEvents opens a server-side stream that emits one message
+  // per direct-scale-eligible SYN observed by the BPF ring buffer. The
+  // controller maintains one stream per agent pod and triggers the
+  // direct-scale fast path when a message arrives.
+  rpc SubscribeSynEvents(SubscribeRequest) returns (stream SynEvent);
+}
+
+// WatchSpec is the complete desired watch state sent on every reconcile.
+// The agent treats missing entries as deletions.
+message WatchSpec {
+  repeated WatchEntry watches = 1;
+}
+
+// WatchEntry describes one Service that the agent must track. A Service
+// with multiple TCP ports yields multiple entries; they share the workload
+// target fields and differ only in port / node_port.
+message WatchEntry {
+  string namespace = 1;
+  string service = 2;
+  string target_kind = 3;   // "Deployment" or "StatefulSet"
+  string target_name = 4;
+  string cluster_ip = 5;    // IPv4 dotted quad
+  uint32 port = 6;          // host byte order
+  int32 node_port = 7;      // 0 if the Service has no NodePort
+  bool proxy_mode = 8;      // BPF: SYN DROP on ingress
+  bool rst_suppress = 9;    // BPF: RST/ICMP DROP on egress
+  bool direct_scale = 10;   // agent emits SSE events for this entry
+}
+
+message PutWatchesResponse {}
+
+message SubscribeRequest {}
+
+// SynEvent is emitted per direct-scale-eligible SYN observed by the agent.
+message SynEvent {
+  string namespace = 1;
+  string target_kind = 2;
+  string target_name = 3;
+}
