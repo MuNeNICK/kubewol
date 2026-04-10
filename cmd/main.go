@@ -76,9 +76,10 @@ func main() {
 	}
 
 	reconciler := &controller.ScaleToZeroReconciler{
-		Client: mgr.GetClient(),
-		Scheme: mgr.GetScheme(),
-		BPF:    bpfMgr,
+		Client:    mgr.GetClient(),
+		APIReader: mgr.GetAPIReader(),
+		Scheme:    mgr.GetScheme(),
+		BPF:       bpfMgr,
 	}
 	if err := reconciler.SetupWithManager(mgr); err != nil {
 		setupLog.Error(err, "unable to create controller")

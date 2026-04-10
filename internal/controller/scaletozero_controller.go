@@ -9,6 +9,7 @@ package controller
 
 import (
 	"context"
+	"fmt"
 	"net"
 	"sync"
 	"time"
@@ -17,6 +18,7 @@ import (
 	autoscalingv1 "k8s.io/api/autoscaling/v1"
 	corev1 "k8s.io/api/core/v1"
 	discoveryv1 "k8s.io/api/discovery/v1"
+	"k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
@@ -35,28 +37,19 @@ const (
 	//   kubectl annotate svc my-app kubewol/enabled=true
 	AnnotationEnabled = "kubewol/enabled"
 
-	// AnnotationTargetKind selects the scale target kind: Deployment (default) or StatefulSet.
-	//   kubectl annotate svc my-app kubewol/target-kind=StatefulSet
-	AnnotationTargetKind = "kubewol/target-kind"
-
 	// AnnotationTargetName overrides the target workload name (default: same as Service name).
+	// The kind (Deployment or StatefulSet) is auto-detected by Get lookup.
 	//   kubectl annotate svc my-app kubewol/target-name=my-sts
 	AnnotationTargetName = "kubewol/target-name"
-
-	// AnnotationDeployment is the legacy alias for AnnotationTargetName (Deployment only).
-	//   kubectl annotate svc my-app kubewol/deployment=my-deploy
-	AnnotationDeployment = "kubewol/deployment"
 
 	// AnnotationDirectScale enables eBPF-triggered direct scale 0->1 (fast path).
 	// When enabled, kubewol patches the target's /scale subresource directly on
 	// SYN detection, bypassing the HPA 15s sync period. ~1s cold start instead of ~19s.
-	// Requires RBAC write on deployments/scale or statefulsets/scale.
 	//   kubectl annotate svc my-app kubewol/direct-scale=true
 	AnnotationDirectScale = "kubewol/direct-scale"
 
-	// TargetKindDeployment and TargetKindStatefulSet are valid values for AnnotationTargetKind.
-	TargetKindDeployment  = "Deployment"
-	TargetKindStatefulSet = "StatefulSet"
+	targetKindDeployment  = "Deployment"
+	targetKindStatefulSet = "StatefulSet"
 )
 
 // WatchEntry tracks BPF state for one Service.
@@ -77,8 +70,11 @@ type WatchEntry struct {
 // ScaleToZeroReconciler reconciles Services annotated with kubewol/enabled=true.
 type ScaleToZeroReconciler struct {
 	client.Client
-	Scheme *runtime.Scheme
-	BPF    *bpf.Manager
+	// APIReader is a non-cached client for one-off Deployment/StatefulSet lookups
+	// to avoid spinning up cluster-wide watches on these types.
+	APIReader client.Reader
+	Scheme    *runtime.Scheme
+	BPF       *bpf.Manager
 
 	mu      sync.RWMutex
 	watches map[types.NamespacedName]*WatchEntry
@@ -90,6 +86,7 @@ type ScaleToZeroReconciler struct {
 
 // +kubebuilder:rbac:groups="",resources=services,verbs=get;list;watch
 // +kubebuilder:rbac:groups=discovery.k8s.io,resources=endpointslices,verbs=list;watch
+// +kubebuilder:rbac:groups=apps,resources=deployments;statefulsets,verbs=get
 // +kubebuilder:rbac:groups=apps,resources=deployments/scale,verbs=get;update;patch
 // +kubebuilder:rbac:groups=apps,resources=statefulsets/scale,verbs=get;update;patch
 
@@ -115,16 +112,14 @@ func (r *ScaleToZeroReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 		return ctrl.Result{}, nil
 	}
 
-	targetKind := svc.Annotations[AnnotationTargetKind]
-	if targetKind == "" {
-		targetKind = TargetKindDeployment
-	}
 	targetName := svc.Annotations[AnnotationTargetName]
 	if targetName == "" {
-		targetName = svc.Annotations[AnnotationDeployment] // legacy
-	}
-	if targetName == "" {
 		targetName = svc.Name
+	}
+	targetKind, err := r.detectTargetKind(ctx, svc.Namespace, targetName)
+	if err != nil {
+		logger.Error(err, "failed to detect target kind", "target", targetName)
+		return ctrl.Result{RequeueAfter: 10 * time.Second}, nil
 	}
 
 	var port uint16
@@ -196,6 +191,33 @@ func (r *ScaleToZeroReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 	}
 
 	return ctrl.Result{}, nil
+}
+
+// detectTargetKind checks whether the target name is a Deployment or StatefulSet.
+// Tries Deployment first, falls back to StatefulSet. Uses APIReader to bypass the
+// controller-runtime cache (avoids cluster-wide watches on these types).
+func (r *ScaleToZeroReconciler) detectTargetKind(ctx context.Context, ns, name string) (string, error) {
+	key := client.ObjectKey{Namespace: ns, Name: name}
+	reader := r.APIReader
+	if reader == nil {
+		reader = r.Client
+	}
+
+	var d appsv1.Deployment
+	if err := reader.Get(ctx, key, &d); err == nil {
+		return targetKindDeployment, nil
+	} else if !errors.IsNotFound(err) {
+		return "", err
+	}
+
+	var s appsv1.StatefulSet
+	if err := reader.Get(ctx, key, &s); err == nil {
+		return targetKindStatefulSet, nil
+	} else if !errors.IsNotFound(err) {
+		return "", err
+	}
+
+	return "", fmt.Errorf("no Deployment or StatefulSet named %q in namespace %q", name, ns)
 }
 
 func (r *ScaleToZeroReconciler) removeWatch(name types.NamespacedName) {
@@ -299,7 +321,7 @@ func (r *ScaleToZeroReconciler) TriggerScale(ctx context.Context, namespace, kin
 
 	var target client.Object
 	switch kind {
-	case TargetKindStatefulSet:
+	case targetKindStatefulSet:
 		target = &appsv1.StatefulSet{ObjectMeta: metav1.ObjectMeta{Namespace: namespace, Name: name}}
 	default:
 		target = &appsv1.Deployment{ObjectMeta: metav1.ObjectMeta{Namespace: namespace, Name: name}}

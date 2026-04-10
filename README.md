@@ -134,18 +134,10 @@ When no traffic arrives, HPA scales the Deployment to 0. When a TCP SYN is detec
 | Annotation | Required | Default | Description |
 |---|---|---|---|
 | `kubewol/enabled` | Yes | - | Set to `"true"` to enable monitoring |
-| `kubewol/target-kind` | No | `Deployment` | `Deployment` or `StatefulSet` |
 | `kubewol/target-name` | No | Service name | Target workload name if different from Service |
-| `kubewol/deployment` | No | - | Legacy alias for `target-name` (Deployment only) |
 | `kubewol/direct-scale` | No | `false` | Set to `"true"` to bypass HPA for 0→1 (fast path, see below) |
 
-Example for a StatefulSet:
-
-```bash
-kubectl annotate svc my-db kubewol/enabled=true \
-  kubewol/target-kind=StatefulSet \
-  kubewol/target-name=my-db-sts
-```
+The target workload kind (`Deployment` or `StatefulSet`) is auto-detected. Both are supported.
 
 ### Direct scale (fast path)
 
