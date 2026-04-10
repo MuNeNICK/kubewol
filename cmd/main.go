@@ -55,7 +55,9 @@ func main() {
 
 	// eBPF
 	setupLog.Info("loading eBPF programs")
-	bpfMgr, err := bpf.NewManager()
+	bpfMgr, err := bpf.NewManager(bpf.Options{
+		Logger: ctrl.Log.WithName("ebpf"),
+	})
 	if err != nil {
 		setupLog.Error(err, "failed to init eBPF")
 		os.Exit(1)
@@ -119,6 +121,14 @@ func main() {
 	}
 }
 
+// scaleJob is queued to the bounded worker pool when a SYN event hints
+// at a direct-scale opportunity.
+type scaleJob struct {
+	namespace string
+	kind      string
+	name      string
+}
+
 func readSynEvents(
 	ctx context.Context,
 	bpfMgr *bpf.Manager,
@@ -139,6 +149,22 @@ func readSynEvents(
 	defer reader.Close()
 	go func() { <-ctx.Done(); reader.Close() }()
 
+	// Bounded worker pool for direct-scale triggers. A small pool is enough because
+	// TriggerScale is debounced per-target and is short-lived (few ms in the hot path).
+	// A bounded buffered channel provides backpressure: if workers fall behind under
+	// a SYN burst, we drop redundant jobs rather than spawning unbounded goroutines.
+	const scaleWorkers = 4
+	const scaleQueueDepth = 64
+	scaleCh := make(chan scaleJob, scaleQueueDepth)
+	for i := 0; i < scaleWorkers; i++ {
+		go func() {
+			for job := range scaleCh {
+				reconciler.TriggerScale(ctx, job.namespace, job.kind, job.name)
+			}
+		}()
+	}
+	defer close(scaleCh)
+
 	logger.Info("ring buffer reader started")
 	for {
 		evt, err := reader.ReadEvent()
@@ -158,7 +184,18 @@ func readSynEvents(
 
 		// Direct scale trigger (opt-in via kubewol/direct-scale annotation)
 		if entry := reconciler.LookupByBPFKey(evt.DstAddr, evt.DstPort); entry != nil {
-			go reconciler.TriggerScale(ctx, entry.Namespace, entry.TargetKind, entry.TargetName)
+			select {
+			case scaleCh <- scaleJob{
+				namespace: entry.Namespace,
+				kind:      entry.TargetKind,
+				name:      entry.TargetName,
+			}:
+			default:
+				// Queue is full; a previous event for the same target is either
+				// in-flight or already debounced. Drop.
+				logger.V(1).Info("scale queue full, dropping SYN event",
+					"target", entry.Namespace+"/"+entry.TargetName)
+			}
 		}
 	}
 }
