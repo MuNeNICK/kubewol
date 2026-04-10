@@ -13,6 +13,15 @@ rules:
   - list
   - watch
 - apiGroups:
+  - apps
+  resources:
+  - deployments/scale
+  - statefulsets/scale
+  verbs:
+  - get
+  - patch
+  - update
+- apiGroups:
   - discovery.k8s.io
   resources:
   - endpointslices

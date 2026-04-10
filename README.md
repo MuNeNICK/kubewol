@@ -134,7 +134,39 @@ When no traffic arrives, HPA scales the Deployment to 0. When a TCP SYN is detec
 | Annotation | Required | Default | Description |
 |---|---|---|---|
 | `kubewol/enabled` | Yes | - | Set to `"true"` to enable monitoring |
-| `kubewol/deployment` | No | Service name | Deployment name if different from Service |
+| `kubewol/target-kind` | No | `Deployment` | `Deployment` or `StatefulSet` |
+| `kubewol/target-name` | No | Service name | Target workload name if different from Service |
+| `kubewol/deployment` | No | - | Legacy alias for `target-name` (Deployment only) |
+| `kubewol/direct-scale` | No | `false` | Set to `"true"` to bypass HPA for 0→1 (fast path, see below) |
+
+Example for a StatefulSet:
+
+```bash
+kubectl annotate svc my-db kubewol/enabled=true \
+  kubewol/target-kind=StatefulSet \
+  kubewol/target-name=my-db-sts
+```
+
+### Direct scale (fast path)
+
+By default, kubewol is a pure Prometheus exporter and HPA handles all scaling decisions. Cold start is ~19s (dominated by HPA 15s sync period).
+
+Setting `kubewol/direct-scale=true` on the Service enables a fast path:
+
+```bash
+kubectl annotate svc my-app kubewol/direct-scale=true
+```
+
+- On SYN detection, kubewol directly patches `deployments/scale` (0→1) via the K8s API
+- Cold start drops from ~19s to **~1s**
+- HPA still handles 1→N and N→0 (kubewol only triggers 0→1)
+- Requires RBAC write on `deployments/scale` (already included)
+- Can coexist with HPA; direct scale wins the race to 1, then HPA takes over
+
+Useful when:
+- You want the absolute fastest cold start
+- You can't install Prometheus + Adapter (kubewol works standalone for 0→1)
+- You need to avoid KEDA's External Metrics API conflict
 
 ## Flags
 

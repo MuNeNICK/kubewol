@@ -17,13 +17,6 @@ type ringbufReader struct {
 	rd *ringbuf.Reader
 }
 
-type synEventLog struct {
-	SrcAddr string
-	SrcPort uint16
-	DstAddr string
-	DstPort uint16
-}
-
 func newRingbufReader(m *ebpf.Map) (*ringbufReader, error) {
 	rd, err := ringbuf.NewReader(m)
 	if err != nil {
@@ -32,27 +25,23 @@ func newRingbufReader(m *ebpf.Map) (*ringbufReader, error) {
 	return &ringbufReader{rd: rd}, nil
 }
 
-func (r *ringbufReader) ReadEvent() (synEventLog, error) {
+// ReadEvent returns the raw BPF SYN event (fields in network byte order).
+func (r *ringbufReader) ReadEvent() (bpf.SynEvent, error) {
 	record, err := r.rd.Read()
 	if err != nil {
 		if errors.Is(err, ringbuf.ErrClosed) {
-			return synEventLog{}, err
+			return bpf.SynEvent{}, err
 		}
-		return synEventLog{}, err
+		return bpf.SynEvent{}, err
 	}
 	if len(record.RawSample) < int(unsafe.Sizeof(bpf.SynEvent{})) {
-		return synEventLog{}, fmt.Errorf("short sample")
+		return bpf.SynEvent{}, fmt.Errorf("short sample")
 	}
 	var evt bpf.SynEvent
 	if err := binary.Read(bytes.NewReader(record.RawSample), binary.LittleEndian, &evt); err != nil {
-		return synEventLog{}, err
+		return bpf.SynEvent{}, err
 	}
-	return synEventLog{
-		SrcAddr: bpf.Uint32ToIP(evt.SrcAddr).String(),
-		SrcPort: bpf.Ntohs(evt.SrcPort),
-		DstAddr: bpf.Uint32ToIP(evt.DstAddr).String(),
-		DstPort: bpf.Ntohs(evt.DstPort),
-	}, nil
+	return evt, nil
 }
 
 func (r *ringbufReader) Close() { _ = r.rd.Close() }

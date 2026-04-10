@@ -1,7 +1,7 @@
 # Pre-compile eBPF outside Docker (requires clang + kernel headers on host).
 # The compiled .o is embedded via go:embed in internal/ebpf/loader.go.
 
-FROM golang:1.24 AS builder
+FROM golang:1.26 AS builder
 WORKDIR /workspace
 COPY go.mod go.sum ./
 RUN go mod download

@@ -13,8 +13,11 @@ import (
 	"sync"
 	"time"
 
+	appsv1 "k8s.io/api/apps/v1"
+	autoscalingv1 "k8s.io/api/autoscaling/v1"
 	corev1 "k8s.io/api/core/v1"
 	discoveryv1 "k8s.io/api/discovery/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
 	ctrl "sigs.k8s.io/controller-runtime"
@@ -32,22 +35,43 @@ const (
 	//   kubectl annotate svc my-app kubewol/enabled=true
 	AnnotationEnabled = "kubewol/enabled"
 
-	// AnnotationDeployment overrides the Deployment name (default: same as Service name).
+	// AnnotationTargetKind selects the scale target kind: Deployment (default) or StatefulSet.
+	//   kubectl annotate svc my-app kubewol/target-kind=StatefulSet
+	AnnotationTargetKind = "kubewol/target-kind"
+
+	// AnnotationTargetName overrides the target workload name (default: same as Service name).
+	//   kubectl annotate svc my-app kubewol/target-name=my-sts
+	AnnotationTargetName = "kubewol/target-name"
+
+	// AnnotationDeployment is the legacy alias for AnnotationTargetName (Deployment only).
 	//   kubectl annotate svc my-app kubewol/deployment=my-deploy
 	AnnotationDeployment = "kubewol/deployment"
+
+	// AnnotationDirectScale enables eBPF-triggered direct scale 0->1 (fast path).
+	// When enabled, kubewol patches the target's /scale subresource directly on
+	// SYN detection, bypassing the HPA 15s sync period. ~1s cold start instead of ~19s.
+	// Requires RBAC write on deployments/scale or statefulsets/scale.
+	//   kubectl annotate svc my-app kubewol/direct-scale=true
+	AnnotationDirectScale = "kubewol/direct-scale"
+
+	// TargetKindDeployment and TargetKindStatefulSet are valid values for AnnotationTargetKind.
+	TargetKindDeployment  = "Deployment"
+	TargetKindStatefulSet = "StatefulSet"
 )
 
 // WatchEntry tracks BPF state for one Service.
 type WatchEntry struct {
-	Namespace  string
-	Service    string
-	Deployment string
-	ClusterIP  net.IP
-	Port       uint16
-	NodePort   int32
-	BPFKey     bpf.SvcKey
-	ProxyMode  bool
-	ReadySince time.Time // when endpoints first became ready (zero = not ready)
+	Namespace   string
+	Service     string
+	TargetKind  string // "Deployment" or "StatefulSet"
+	TargetName  string // workload name to scale
+	ClusterIP   net.IP
+	Port        uint16
+	NodePort    int32
+	BPFKey      bpf.SvcKey
+	ProxyMode   bool
+	DirectScale bool      // eBPF SYN triggers direct scale API call (fast path)
+	ReadySince  time.Time // when endpoints first became ready (zero = not ready)
 }
 
 // ScaleToZeroReconciler reconciles Services annotated with kubewol/enabled=true.
@@ -58,10 +82,16 @@ type ScaleToZeroReconciler struct {
 
 	mu      sync.RWMutex
 	watches map[types.NamespacedName]*WatchEntry
+
+	// scaleInflight debounces direct-scale triggers per deployment.
+	scaleMu       sync.Mutex
+	scaleInflight map[string]time.Time
 }
 
 // +kubebuilder:rbac:groups="",resources=services,verbs=get;list;watch
 // +kubebuilder:rbac:groups=discovery.k8s.io,resources=endpointslices,verbs=list;watch
+// +kubebuilder:rbac:groups=apps,resources=deployments/scale,verbs=get;update;patch
+// +kubebuilder:rbac:groups=apps,resources=statefulsets/scale,verbs=get;update;patch
 
 func (r *ScaleToZeroReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
 	logger := log.FromContext(ctx)
@@ -85,9 +115,16 @@ func (r *ScaleToZeroReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 		return ctrl.Result{}, nil
 	}
 
-	deployName := svc.Annotations[AnnotationDeployment]
-	if deployName == "" {
-		deployName = svc.Name
+	targetKind := svc.Annotations[AnnotationTargetKind]
+	if targetKind == "" {
+		targetKind = TargetKindDeployment
+	}
+	targetName := svc.Annotations[AnnotationTargetName]
+	if targetName == "" {
+		targetName = svc.Annotations[AnnotationDeployment] // legacy
+	}
+	if targetName == "" {
+		targetName = svc.Name
 	}
 
 	var port uint16
@@ -135,18 +172,23 @@ func (r *ScaleToZeroReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 	rstSuppress := ready == 0 || time.Since(readySince) < rstSuppressDelay
 	r.BPF.SetRstSuppress(bpfKey, rstSuppress, nodePort)
 
+	directScale := svc.Annotations[AnnotationDirectScale] == "true"
+
 	r.watches[req.NamespacedName] = &WatchEntry{
 		Namespace: svc.Namespace, Service: svc.Name,
-		Deployment: deployName, ClusterIP: ip, Port: port,
-		NodePort: nodePort, BPFKey: bpfKey, ProxyMode: proxyMode,
-		ReadySince: readySince,
+		TargetKind: targetKind, TargetName: targetName,
+		ClusterIP: ip, Port: port, NodePort: nodePort,
+		BPFKey: bpfKey, ProxyMode: proxyMode,
+		DirectScale: directScale, ReadySince: readySince,
 	}
 	r.mu.Unlock()
 
 	logger.Info("reconciled",
 		"service", svc.Name, "clusterIP", svc.Spec.ClusterIP,
 		"port", port, "nodePort", nodePort,
-		"proxyMode", proxyMode, "rstSuppress", rstSuppress, "readyEndpoints", ready)
+		"target", targetKind+"/"+targetName,
+		"proxyMode", proxyMode, "rstSuppress", rstSuppress,
+		"directScale", directScale, "readyEndpoints", ready)
 
 	// Requeue to disable rst_suppress after delay
 	if rstSuppress && ready > 0 {
@@ -209,6 +251,65 @@ func (r *ScaleToZeroReconciler) MetricsProvider() metrics.Provider {
 		}
 		return out
 	}
+}
+
+// LookupByBPFKey finds a watch entry matching the BPF destination.
+// Matches either ClusterIP:port or *:nodePort (for NodePort traffic).
+// Returns nil if no match or if direct-scale is not enabled.
+func (r *ScaleToZeroReconciler) LookupByBPFKey(dstAddr uint32, dstPort uint16) *WatchEntry {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	for _, e := range r.watches {
+		clusterIPMatch := e.BPFKey.Addr == dstAddr && e.BPFKey.Port == dstPort
+		nodePortMatch := e.NodePort > 0 && dstPort == bpf.Htons(uint16(e.NodePort))
+		if clusterIPMatch || nodePortMatch {
+			if !e.DirectScale {
+				return nil
+			}
+			cp := *e
+			return &cp
+		}
+	}
+	return nil
+}
+
+// TriggerScale patches the target workload's /scale subresource from 0 to 1.
+// Supports Deployment and StatefulSet. Debounced per target to avoid concurrent calls.
+func (r *ScaleToZeroReconciler) TriggerScale(ctx context.Context, namespace, kind, name string) {
+	key := namespace + "/" + kind + "/" + name
+
+	r.scaleMu.Lock()
+	if last, ok := r.scaleInflight[key]; ok && time.Since(last) < 30*time.Second {
+		r.scaleMu.Unlock()
+		return
+	}
+	if r.scaleInflight == nil {
+		r.scaleInflight = make(map[string]time.Time)
+	}
+	r.scaleInflight[key] = time.Now()
+	r.scaleMu.Unlock()
+
+	logger := log.FromContext(ctx).WithName("direct-scale")
+	start := time.Now()
+
+	scale := &autoscalingv1.Scale{
+		ObjectMeta: metav1.ObjectMeta{Namespace: namespace, Name: name},
+		Spec:       autoscalingv1.ScaleSpec{Replicas: 1},
+	}
+
+	var target client.Object
+	switch kind {
+	case TargetKindStatefulSet:
+		target = &appsv1.StatefulSet{ObjectMeta: metav1.ObjectMeta{Namespace: namespace, Name: name}}
+	default:
+		target = &appsv1.Deployment{ObjectMeta: metav1.ObjectMeta{Namespace: namespace, Name: name}}
+	}
+
+	if err := r.SubResource("scale").Update(ctx, target, client.WithSubResourceBody(scale)); err != nil {
+		logger.Error(err, "scale 0->1 failed", "target", key)
+		return
+	}
+	logger.Info("scaled 0->1", "target", key, "duration", time.Since(start))
 }
 
 // SetupWithManager registers the controller.

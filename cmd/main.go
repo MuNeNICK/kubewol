@@ -107,9 +107,9 @@ func main() {
 		}
 	}()
 
-	// Ring buffer reader: log SYN events + trigger Remote Write push
+	// Ring buffer reader: log SYN events + trigger Remote Write push + direct scale
 	ctx := ctrl.SetupSignalHandler()
-	go readSynEvents(ctx, bpfMgr, exporter)
+	go readSynEvents(ctx, bpfMgr, exporter, reconciler)
 
 	setupLog.Info("starting manager")
 	if err := mgr.Start(ctx); err != nil {
@@ -118,7 +118,12 @@ func main() {
 	}
 }
 
-func readSynEvents(ctx context.Context, bpfMgr *bpf.Manager, exporter *metrics.Exporter) {
+func readSynEvents(
+	ctx context.Context,
+	bpfMgr *bpf.Manager,
+	exporter *metrics.Exporter,
+	reconciler *controller.ScaleToZeroReconciler,
+) {
 	eventsMap := bpfMgr.SynEventsMap()
 	if eventsMap == nil {
 		return
@@ -140,12 +145,19 @@ func readSynEvents(ctx context.Context, bpfMgr *bpf.Manager, exporter *metrics.E
 			return
 		}
 		logger.V(1).Info("SYN detected",
-			"src", evt.SrcAddr, "srcPort", evt.SrcPort,
-			"dst", evt.DstAddr, "dstPort", evt.DstPort)
+			"src", bpf.Uint32ToIP(evt.SrcAddr).String(),
+			"srcPort", bpf.Ntohs(evt.SrcPort),
+			"dst", bpf.Uint32ToIP(evt.DstAddr).String(),
+			"dstPort", bpf.Ntohs(evt.DstPort))
 
 		// Push to Prometheus via Remote Write for fast cold start
 		if err := exporter.PushRemoteWrite(); err != nil {
 			logger.V(1).Info("remote write push failed", "error", err)
+		}
+
+		// Direct scale trigger (opt-in via kubewol/direct-scale annotation)
+		if entry := reconciler.LookupByBPFKey(evt.DstAddr, evt.DstPort); entry != nil {
+			go reconciler.TriggerScale(ctx, entry.Namespace, entry.TargetKind, entry.TargetName)
 		}
 	}
 }
