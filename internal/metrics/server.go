@@ -14,7 +14,6 @@ import (
 
 	"github.com/golang/snappy"
 	"github.com/prometheus/client_golang/prometheus"
-	"github.com/prometheus/client_golang/prometheus/promhttp"
 )
 
 // ServiceMetric holds the current SYN count for a service.
@@ -33,6 +32,11 @@ type Provider func() []ServiceMetric
 type DropProvider func() (map[string]uint64, error)
 
 // Exporter exposes Prometheus /metrics and pushes via Remote Write on demand.
+//
+// The exporter implements prometheus.Collector and is registered with the
+// controller-runtime shared metrics registry in main.go, so /metrics is served
+// by the controller-runtime metrics server (with built-in TLS + TokenReview
+// authentication) rather than a hand-rolled HTTP listener.
 type Exporter struct {
 	provider       Provider
 	dropProvider   DropProvider
@@ -63,6 +67,12 @@ func NewExporter(provider Provider, dropProvider DropProvider, remoteWriteURL st
 	}
 }
 
+// Register adds this exporter to the given Prometheus registry. Use this to
+// attach the eBPF metrics to controller-runtime's shared metrics.Registry.
+func (e *Exporter) Register(reg prometheus.Registerer) error {
+	return reg.Register(e)
+}
+
 // Describe implements prometheus.Collector.
 func (e *Exporter) Describe(ch chan<- *prometheus.Desc) {
 	ch <- e.desc
@@ -89,13 +99,6 @@ func (e *Exporter) Collect(ch chan<- prometheus.Metric) {
 			e.dropDesc, prometheus.CounterValue, float64(count), reason,
 		)
 	}
-}
-
-// Handler returns the Prometheus HTTP handler.
-func (e *Exporter) Handler() http.Handler {
-	reg := prometheus.NewRegistry()
-	reg.MustRegister(e)
-	return promhttp.HandlerFor(reg, promhttp.HandlerOpts{})
 }
 
 // PushRemoteWrite sends current metrics to Prometheus via Remote Write.

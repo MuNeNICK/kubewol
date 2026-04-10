@@ -26,7 +26,8 @@ spec:
       annotations:
         kubectl.kubernetes.io/default-container: manager
         prometheus.io/scrape: "true"
-        prometheus.io/port: "9090"
+        prometheus.io/scheme: "https"
+        prometheus.io/port: "8443"
         prometheus.io/path: "/metrics"
       labels:
         control-plane: controller-manager
@@ -45,35 +46,48 @@ spec:
             - /manager
           args:
             - --health-probe-bind-address=:8081
-            - --metrics-bind-address=:9090
+            - --metrics-bind-address=:8443
             # Uncomment and configure to enable Remote Write push for fast cold start:
             # - --remote-write-url=http://prometheus-server.monitoring.svc:80/api/v1/write
           image: controller:latest
           imagePullPolicy: IfNotPresent
           name: manager
-          # Note: hostPort is intentionally NOT declared. With hostNetwork: true the
-          # process binds the port directly in the host network namespace, so hostPort
-          # is redundant and only inflates the apparent attack surface. The /metrics
-          # endpoint is unauthenticated; restrict access via the provided NetworkPolicy
-          # at config/network-policy/allow-metrics-traffic.yaml.
+          # hostPort is intentionally NOT declared. With hostNetwork: true the
+          # process binds the port directly in the host network namespace, so
+          # hostPort is redundant. /metrics is served over HTTPS and gated by
+          # Kubernetes TokenReview / SubjectAccessReview; scrapers must present
+          # a ServiceAccount token bound to kubewol-metrics-reader.
           ports:
-            - containerPort: 9090
-              name: metrics
+            - containerPort: 8443
+              name: https-metrics
             - containerPort: 8081
               name: healthz
           # Container-level security: drop privileged and grant only the
           # minimal capabilities needed for eBPF TC attach and map operations.
           #
-          # - CAP_BPF: load/attach eBPF programs, create/update BPF maps
+          # - CAP_BPF: load eBPF programs, create/update BPF maps
           # - CAP_NET_ADMIN: attach TC (tcx) hooks to network interfaces
-          # - CAP_PERFMON: allow bpf() syscalls for program loading (kernel 5.8+)
-          # - CAP_SYS_RESOURCE: raise RLIMIT_MEMLOCK for older kernels (5.11-)
+          # - CAP_PERFMON: required by the BPF verifier to allow pointer
+          #   arithmetic on packet data (parse_l3 skips the Ethernet + VLAN
+          #   headers, egress_rst_filter walks inner IP payload). Without it
+          #   the verifier rejects programs with "pointer arithmetic with it
+          #   prohibited for !root". Not related to perf_event_open.
+          #
+          # CAP_SYS_RESOURCE was previously added to raise RLIMIT_MEMLOCK on
+          # kernels <5.11. This project targets kernel 6.6+ (TCX), where BPF
+          # memory accounting is cgroup-based and CAP_BPF already bypasses the
+          # memlock rlimit, so the capability is no longer required.
           securityContext:
             privileged: false
             allowPrivilegeEscalation: false
             readOnlyRootFilesystem: true
-            runAsNonRoot: false # eBPF load requires root in the pod UTS namespace
-            runAsUser: 0
+            # eBPF load/attach is gated on file capabilities, not UID: with
+            # CAP_BPF + CAP_NET_ADMIN (+ CAP_PERFMON) a non-root user can
+            # bpf(BPF_PROG_LOAD) and AttachTCX just fine. Running as an
+            # unprivileged user shrinks the blast radius of a container escape.
+            runAsNonRoot: true
+            runAsUser: 65532
+            runAsGroup: 65532
             capabilities:
               drop:
                 - ALL
@@ -81,7 +95,6 @@ spec:
                 - BPF
                 - NET_ADMIN
                 - PERFMON
-                - SYS_RESOURCE
           livenessProbe:
             httpGet:
               path: /healthz

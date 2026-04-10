@@ -11,7 +11,6 @@ import (
 	"context"
 	"flag"
 	"net"
-	"net/http"
 	"os"
 	"strings"
 	"time"
@@ -24,6 +23,8 @@ import (
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/healthz"
 	"sigs.k8s.io/controller-runtime/pkg/log/zap"
+	ctrlmetrics "sigs.k8s.io/controller-runtime/pkg/metrics"
+	metricsfilters "sigs.k8s.io/controller-runtime/pkg/metrics/filters"
 	metricsserver "sigs.k8s.io/controller-runtime/pkg/metrics/server"
 
 	"github.com/munenick/kubewol/internal/controller"
@@ -48,7 +49,11 @@ func main() {
 	var ifaceDeny string
 
 	flag.StringVar(&probeAddr, "health-probe-bind-address", ":8081", "Health probe bind address.")
-	flag.StringVar(&metricsAddr, "metrics-bind-address", ":9090", "Prometheus /metrics bind address.")
+	flag.StringVar(&metricsAddr, "metrics-bind-address", ":8443",
+		"Prometheus /metrics bind address. Served over HTTPS with a self-signed "+
+			"certificate and gated by Kubernetes TokenReview / SubjectAccessReview; "+
+			"clients must present a ServiceAccount token bound to the "+
+			"kubewol-metrics-reader ClusterRole.")
 	flag.StringVar(&remoteWriteURL, "remote-write-url", "",
 		"Prometheus Remote Write URL (e.g. http://prometheus:9090/api/v1/write). "+
 			"When set, metrics are pushed immediately on SYN detection for fast cold start.")
@@ -82,10 +87,21 @@ func main() {
 	defer bpfMgr.Close()
 	setupLog.Info("eBPF programs loaded and attached")
 
-	// Controller manager (disable built-in metrics, we serve our own)
+	// Controller manager: /metrics is served by controller-runtime over HTTPS,
+	// with TokenReview + SubjectAccessReview authn/z against the Kubernetes API.
+	// Scraping clients (Prometheus / Prometheus Adapter) must present a bearer
+	// token bound to the kubewol-metrics-reader ClusterRole.
+	//
+	// A self-signed certificate is generated in-memory at startup by the
+	// controller-runtime metrics server (no disk write, works with
+	// readOnlyRootFilesystem: true).
 	mgr, err := ctrl.NewManager(ctrl.GetConfigOrDie(), ctrl.Options{
-		Scheme:                 scheme,
-		Metrics:                metricsserver.Options{BindAddress: "0"},
+		Scheme: scheme,
+		Metrics: metricsserver.Options{
+			BindAddress:    metricsAddr,
+			SecureServing:  true,
+			FilterProvider: metricsfilters.WithAuthenticationAndAuthorization,
+		},
 		HealthProbeBindAddress: probeAddr,
 		LeaderElection:         false, // DaemonSet, each pod runs independently
 	})
@@ -114,28 +130,17 @@ func main() {
 		os.Exit(1)
 	}
 
-	// Prometheus exporter + Remote Write
+	// Register the eBPF exporter with controller-runtime's shared Prometheus
+	// registry so it is served by the authenticated /metrics endpoint above.
 	exporter := metrics.NewExporter(
 		reconciler.MetricsProvider(),
 		bpfMgr.DropCounts,
 		remoteWriteURL,
 	)
-
-	// Prometheus /metrics HTTP server.
-	// SECURITY: this endpoint is unauthenticated. With hostNetwork: true the
-	// process binds 0.0.0.0:metricsAddr on the node, so anything on the node
-	// network can scrape it. Apply config/network-policy/allow-metrics-traffic.yaml
-	// (or an equivalent NetworkPolicy) to restrict access to your Prometheus
-	// namespace. See README "Securing the metrics endpoint" for details.
-	mux := http.NewServeMux()
-	mux.Handle("/metrics", exporter.Handler())
-	go func() {
-		setupLog.Info("Prometheus exporter listening (UNAUTHENTICATED, restrict via NetworkPolicy)",
-			"addr", metricsAddr)
-		if err := http.ListenAndServe(metricsAddr, mux); err != nil {
-			setupLog.Error(err, "metrics server failed")
-		}
-	}()
+	if err := exporter.Register(ctrlmetrics.Registry); err != nil {
+		setupLog.Error(err, "unable to register eBPF exporter")
+		os.Exit(1)
+	}
 
 	// Ring buffer reader: log SYN events + trigger Remote Write push + direct scale
 	ctx := ctrl.SetupSignalHandler()

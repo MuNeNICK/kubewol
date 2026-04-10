@@ -1,12 +1,13 @@
-# Restricts ingress to the kubewol /metrics endpoint (port 9090).
+# Defense-in-depth: restricts ingress to the kubewol /metrics endpoint (8443).
 #
-# Because the DaemonSet runs with hostNetwork: true and binds to hostPort 9090,
-# metrics are reachable via the node IP. Without this NetworkPolicy, anything
-# with routing to the node network (other pods, other nodes, or out-of-cluster
-# clients on the pod network) can scrape service names and SYN counts.
+# The endpoint is already protected by Kubernetes TokenReview +
+# SubjectAccessReview (see config/rbac/metrics_auth_role.yaml and
+# metrics_reader_role.yaml) and served over HTTPS, so an attacker who reaches
+# the port still needs a ServiceAccount token bound to kubewol-metrics-reader.
+# This NetworkPolicy narrows the exposure further on CNIs that honor
+# NetworkPolicy for host-networked pods (e.g. Calico).
 #
-# Label your Prometheus namespace with `kubewol-metrics=scraper` to allow
-# scraping from it:
+# Label your Prometheus namespace to allow scraping:
 #   kubectl label ns monitoring kubewol-metrics=scraper
 apiVersion: networking.k8s.io/v1
 kind: NetworkPolicy
@@ -29,5 +30,5 @@ spec:
             matchLabels:
               kubewol-metrics: scraper
       ports:
-        - port: 9090
+        - port: 8443
           protocol: TCP
