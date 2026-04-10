@@ -53,5 +53,5 @@ roleRef:
   name: kubewol-direct-scale
 subjects:
   - kind: ServiceAccount
-    name: kubewol-controller-manager
+    name: kubewol-controller
     namespace: kubewol-system

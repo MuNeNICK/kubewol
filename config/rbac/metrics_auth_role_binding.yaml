@@ -2,11 +2,17 @@ apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRoleBinding
 metadata:
   name: metrics-auth-rolebinding
+  labels:
+    app.kubernetes.io/name: kubewol
+    app.kubernetes.io/managed-by: kustomize
 roleRef:
   apiGroup: rbac.authorization.k8s.io
   kind: ClusterRole
   name: metrics-auth-role
 subjects:
-- kind: ServiceAccount
-  name: controller-manager
-  namespace: system
+  - kind: ServiceAccount
+    name: agent
+    namespace: system
+  - kind: ServiceAccount
+    name: controller
+    namespace: system

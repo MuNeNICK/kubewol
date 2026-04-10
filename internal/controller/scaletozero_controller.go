@@ -29,8 +29,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/log"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
-	bpf "github.com/munenick/kubewol/internal/ebpf"
-	"github.com/munenick/kubewol/internal/metrics"
+	"github.com/munenick/kubewol/internal/agentapi"
 )
 
 const (
@@ -58,15 +57,12 @@ const (
 
 	// rstSuppressDelay keeps egress RST suppression ON after endpoints become ready
 	// to cover kube-proxy iptables/ipvs rule propagation delay (typically <1s).
-	// Kept short to minimize the window where legitimate backend RSTs could be
-	// over-suppressed; the eBPF egress filter additionally only drops payload-less
-	// RSTs (kube-proxy REJECT pattern) so app-level resets carrying data still pass.
 	rstSuppressDelay = 2 * time.Second
 
-	// scaleDebounce is the minimum interval between direct-scale triggers for the same target.
-	// Successful (and already-scaled) entries are retained so a burst of SYN events
-	// cannot hammer the scale subresource. Failed entries are cleared so retries
-	// are not suppressed indefinitely after a transient error.
+	// scaleDebounce is the minimum interval between direct-scale triggers for
+	// the same target. Successful (and already-scaled) entries are retained so
+	// a burst of SYN events cannot hammer the scale subresource. Failed entries
+	// are cleared so retries are not suppressed indefinitely.
 	scaleDebounce = 5 * time.Second
 
 	// scaleInflightGC bounds scaleInflight growth; entries older than this are
@@ -74,76 +70,50 @@ const (
 	scaleInflightGC = 10 * scaleDebounce
 )
 
-// WatchEntry tracks BPF state for one Service.
+// WatchEntry tracks the desired BPF state for one Service port. Identical in
+// shape to the agent API entry so marshalling is trivial.
 type WatchEntry struct {
 	Namespace   string
 	Service     string
-	TargetKind  string // "Deployment" or "StatefulSet"
-	TargetName  string // workload name to scale
+	TargetKind  string
+	TargetName  string
 	ClusterIP   net.IP
 	Port        uint16
 	NodePort    int32
-	BPFKey      bpf.SvcKey
 	ProxyMode   bool
-	DirectScale bool      // eBPF SYN triggers direct scale API call (fast path)
-	ReadySince  time.Time // when endpoints first became ready (zero = not ready)
+	DirectScale bool
+	ReadySince  time.Time
+}
+
+// AgentFleet is the minimum interface the reconciler needs from the agent
+// discovery + fanout subsystem. Implemented by internal/agent/fleet.Fleet.
+type AgentFleet interface {
+	// PushAll sends the full desired watch state to every known agent in
+	// parallel. Errors are aggregated but do not fail the reconcile — a
+	// temporarily unreachable agent will catch up on the next reconcile.
+	PushAll(ctx context.Context, spec agentapi.WatchSpec) error
 }
 
 // ScaleToZeroReconciler reconciles Services annotated with kubewol/enabled=true.
+// This controller owns the Kubernetes API side of kubewol. It never touches
+// BPF; it pushes WatchSpec snapshots to the kubewol-agent DaemonSet via HTTP
+// and receives SYN events back over SSE.
 type ScaleToZeroReconciler struct {
 	client.Client
 	// APIReader is a non-cached client for one-off Deployment/StatefulSet lookups
-	// to avoid spinning up cluster-wide watches on these types.
+	// and for the live direct-scale annotation check in TriggerScale.
 	APIReader client.Reader
 	Scheme    *runtime.Scheme
-	BPF       *bpf.Manager
+	Fleet     AgentFleet
 
 	mu sync.RWMutex
-	// watches indexes the per-Service WatchEntries. A Service with multiple TCP
-	// ports yields multiple entries; they share Namespace/Service/TargetKind/
-	// TargetName but each has its own Port/NodePort/BPFKey.
+	// watches is the per-Service desired state. Aggregated across all Services
+	// to build the WatchSpec pushed to every agent.
 	watches map[types.NamespacedName][]*WatchEntry
-	// bpfKeyIndex: O(1) reverse lookup from BPF SvcKey to WatchEntry. Used by the
-	// direct-scale hot path so it does not have to scan the watches map.
-	bpfKeyIndex map[bpf.SvcKey]*WatchEntry
-	// nodePortIndex: O(1) reverse lookup from NodePort (network byte order, padded)
-	// to WatchEntry, for NodePort traffic that hits the ring buffer.
-	nodePortIndex map[uint32]*WatchEntry
 
 	// scaleInflight debounces direct-scale triggers per target.
-	// Entries are removed on success and on permanent failure so the map does not
-	// grow unbounded; the timestamp window prevents back-to-back retries.
 	scaleMu       sync.Mutex
 	scaleInflight map[string]time.Time
-}
-
-// indexInsertLocked adds the entry to the reverse-lookup indexes. Caller holds r.mu.
-func (r *ScaleToZeroReconciler) indexInsertLocked(e *WatchEntry) {
-	if r.bpfKeyIndex == nil {
-		r.bpfKeyIndex = make(map[bpf.SvcKey]*WatchEntry)
-	}
-	if r.nodePortIndex == nil {
-		r.nodePortIndex = make(map[uint32]*WatchEntry)
-	}
-	r.bpfKeyIndex[e.BPFKey] = e
-	if e.NodePort > 0 {
-		r.nodePortIndex[uint32(bpf.Htons(uint16(e.NodePort)))] = e
-	}
-}
-
-// indexRemoveLocked removes the entry from the reverse-lookup indexes ONLY if the
-// indexed entry pointer still matches. This avoids removing a fresher entry that a
-// concurrent reconcile installed under the same key. Caller holds r.mu.
-func (r *ScaleToZeroReconciler) indexRemoveLocked(e *WatchEntry) {
-	if cur, ok := r.bpfKeyIndex[e.BPFKey]; ok && cur == e {
-		delete(r.bpfKeyIndex, e.BPFKey)
-	}
-	if e.NodePort > 0 {
-		npKey := uint32(bpf.Htons(uint16(e.NodePort)))
-		if cur, ok := r.nodePortIndex[npKey]; ok && cur == e {
-			delete(r.nodePortIndex, npKey)
-		}
-	}
 }
 
 // Required for observation (always installed):
@@ -153,13 +123,10 @@ func (r *ScaleToZeroReconciler) indexRemoveLocked(e *WatchEntry) {
 //
 // NOTE: direct-scale write permissions (deployments/scale, statefulsets/scale
 // with verbs get;update;patch) are NOT declared here. They live in
-// config/rbac/direct_scale_role.yaml and must be opted into explicitly because
-// cluster-wide write on scale subresources is a powerful privilege. Without this
-// role applied, TriggerScale calls will fail with a forbidden error and the
-// controller falls back to HPA-only behavior.
+// config/rbac/direct_scale_role.yaml and must be opted into explicitly.
 
 // parsedService is the result of validating and extracting the kubewol-relevant
-// fields from a Service. Returned by parseService for the Reconcile loop.
+// fields from a Service.
 type parsedService struct {
 	ip             net.IP
 	ports          []portSpec
@@ -169,8 +136,7 @@ type parsedService struct {
 }
 
 // parseService validates the Service annotations / spec and looks up the target
-// workload kind. Returns (nil, nil, nil) if the Service is disabled or unsupported,
-// in which case the caller should remove any existing watch.
+// workload kind. Returns (nil, nil) if the Service is disabled or unsupported.
 func (r *ScaleToZeroReconciler) parseService(ctx context.Context, svc *corev1.Service) (*parsedService, error) {
 	logger := log.FromContext(ctx)
 
@@ -215,27 +181,20 @@ func (r *ScaleToZeroReconciler) parseService(ctx context.Context, svc *corev1.Se
 	}, nil
 }
 
-// applyWatches programs BPF for the new desired state, then atomically swaps
-// the in-memory index. On any BPF failure, the previous state (both BPF and
-// in-memory) is restored so the controller view and the kernel maps stay
-// consistent with whatever was working before.
-//
-// Order: BPF first (new), restore-on-failure, in-memory swap last. Reconcile
-// for a single Service is single-threaded under controller-runtime, so no
-// locking is needed between the BPF write phase and the swap phase.
-func (r *ScaleToZeroReconciler) applyWatches(svc *corev1.Service, ps *parsedService, ready int, directScale bool) ([]*WatchEntry, bool, error) {
+// buildEntries constructs the desired per-port WatchEntry list for a Service,
+// carrying forward readySince from the previous reconcile so rstSuppress has
+// a stable time reference.
+func (r *ScaleToZeroReconciler) buildEntries(svc *corev1.Service, ps *parsedService, ready int, directScale bool) ([]*WatchEntry, bool) {
 	proxyMode := ready == 0
 	name := client.ObjectKeyFromObject(svc)
 
-	// Snapshot the previous entries (shared reference; entries are not mutated
-	// after publication so a slice copy is enough for rollback).
 	r.mu.RLock()
-	prevList := append([]*WatchEntry(nil), r.watches[name]...)
+	prev := r.watches[name]
 	r.mu.RUnlock()
 
 	var readySince time.Time
-	if len(prevList) > 0 {
-		readySince = prevList[0].ReadySince
+	if len(prev) > 0 {
+		readySince = prev[0].ReadySince
 	}
 	if ready == 0 {
 		readySince = time.Time{}
@@ -247,79 +206,72 @@ func (r *ScaleToZeroReconciler) applyWatches(svc *corev1.Service, ps *parsedServ
 	entries := make([]*WatchEntry, 0, len(ps.ports))
 	for _, p := range ps.ports {
 		entries = append(entries, &WatchEntry{
-			Namespace: svc.Namespace, Service: svc.Name,
-			TargetKind: ps.targetKind, TargetName: ps.targetName,
-			ClusterIP: ps.ip, Port: p.port, NodePort: p.nodePort,
-			BPFKey:      bpf.SvcKey{Addr: bpf.IPToUint32Must(ps.ip), Port: bpf.Htons(p.port)},
+			Namespace:   svc.Namespace,
+			Service:     svc.Name,
+			TargetKind:  ps.targetKind,
+			TargetName:  ps.targetName,
+			ClusterIP:   ps.ip,
+			Port:        p.port,
+			NodePort:    p.nodePort,
 			ProxyMode:   proxyMode,
 			DirectScale: directScale,
 			ReadySince:  readySince,
 		})
 	}
-
-	// Program BPF for the new entries. On first failure, revert BPF to the
-	// snapshot of prevList so a transient map error does not wipe a healthy
-	// working state.
-	programmed := 0
-	for i, e := range entries {
-		if _, err := r.BPF.AddWatch(e.ClusterIP, e.Port, e.NodePort); err != nil {
-			r.revertToPrev(entries[:i], prevList)
-			return nil, false, fmt.Errorf("bpf AddWatch: %w", err)
-		}
-		if err := r.BPF.SetProxyMode(e.BPFKey, proxyMode, e.NodePort); err != nil {
-			r.revertToPrev(entries[:i+1], prevList)
-			return nil, false, fmt.Errorf("bpf SetProxyMode: %w", err)
-		}
-		if err := r.BPF.SetRstSuppress(e.BPFKey, rstSuppress, e.NodePort); err != nil {
-			r.revertToPrev(entries[:i+1], prevList)
-			return nil, false, fmt.Errorf("bpf SetRstSuppress: %w", err)
-		}
-		programmed = i + 1
-	}
-	_ = programmed // only used for clarity; all entries are programmed on success
-
-	// BPF state is now the desired state. Swap the in-memory index.
-	r.mu.Lock()
-	for _, old := range prevList {
-		r.indexRemoveLocked(old)
-	}
-	r.watches[name] = entries
-	for _, e := range entries {
-		r.indexInsertLocked(e)
-	}
-	r.mu.Unlock()
-
-	return entries, rstSuppress, nil
+	return entries, rstSuppress
 }
 
-// revertToPrev undoes a partial BPF apply and re-programs the previous entries
-// so the kernel returns to the last known-good state. Best effort: errors in
-// the revert path are logged but cannot be surfaced (the original error is the
-// one the caller needs to see).
-func (r *ScaleToZeroReconciler) revertToPrev(programmedNew []*WatchEntry, prev []*WatchEntry) {
-	logger := log.Log.WithName("bpf-revert")
-	// Tear down anything the new apply pushed.
-	for _, e := range programmedNew {
-		if err := r.BPF.RemoveWatch(e.ClusterIP, e.Port, e.NodePort); err != nil {
-			logger.Error(err, "revert: RemoveWatch", "svc", e.Namespace+"/"+e.Service, "port", e.Port)
+// pushFleet marshals the complete aggregated state and sends it to every
+// agent. The reconcile keeps the in-memory view only if the push succeeds.
+func (r *ScaleToZeroReconciler) pushFleet(ctx context.Context, name types.NamespacedName, entries []*WatchEntry, rstSuppress bool) error {
+	r.mu.Lock()
+	prev := r.watches[name]
+	r.watches[name] = entries
+	r.mu.Unlock()
+
+	spec := r.buildSpecLocked(rstSuppress)
+	if err := r.Fleet.PushAll(ctx, spec); err != nil {
+		// Roll the in-memory view back so the next reconcile retries cleanly.
+		r.mu.Lock()
+		if len(prev) == 0 {
+			delete(r.watches, name)
+		} else {
+			r.watches[name] = prev
+		}
+		r.mu.Unlock()
+		return err
+	}
+	return nil
+}
+
+// buildSpecLocked snapshots the current watch map into a WatchSpec. Caller
+// must not hold r.mu; this method takes the read lock itself. rstSuppress is
+// applied to the entries for the Service being reconciled; other Services'
+// entries keep their existing RstSuppress flag (tracked by re-reading the
+// current wall clock against ReadySince).
+func (r *ScaleToZeroReconciler) buildSpecLocked(curSvcRstSuppress bool) agentapi.WatchSpec {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	now := time.Now()
+	var out []agentapi.WatchEntry
+	for _, list := range r.watches {
+		for _, e := range list {
+			rst := e.ProxyMode || (!e.ReadySince.IsZero() && now.Sub(e.ReadySince) < rstSuppressDelay)
+			out = append(out, agentapi.WatchEntry{
+				Namespace:   e.Namespace,
+				Service:     e.Service,
+				TargetKind:  e.TargetKind,
+				TargetName:  e.TargetName,
+				ClusterIP:   e.ClusterIP.String(),
+				Port:        e.Port,
+				NodePort:    e.NodePort,
+				ProxyMode:   e.ProxyMode,
+				RstSuppress: rst,
+				DirectScale: e.DirectScale,
+			})
 		}
 	}
-	// Re-program the snapshot so prev ports are back in the map.
-	for _, e := range prev {
-		if _, err := r.BPF.AddWatch(e.ClusterIP, e.Port, e.NodePort); err != nil {
-			logger.Error(err, "revert: AddWatch", "svc", e.Namespace+"/"+e.Service, "port", e.Port)
-			continue
-		}
-		if err := r.BPF.SetProxyMode(e.BPFKey, e.ProxyMode, e.NodePort); err != nil {
-			logger.Error(err, "revert: SetProxyMode", "svc", e.Namespace+"/"+e.Service, "port", e.Port)
-		}
-		// rst_suppress is a time window; re-programming it as "enabled whenever
-		// proxy_mode is on" is a safe superset of the original state.
-		rstOn := e.ProxyMode || time.Since(e.ReadySince) < rstSuppressDelay
-		if err := r.BPF.SetRstSuppress(e.BPFKey, rstOn, e.NodePort); err != nil {
-			logger.Error(err, "revert: SetRstSuppress", "svc", e.Namespace+"/"+e.Service, "port", e.Port)
-		}
-	}
+	return agentapi.WatchSpec{Watches: out}
 }
 
 func (r *ScaleToZeroReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
@@ -328,7 +280,7 @@ func (r *ScaleToZeroReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 	var svc corev1.Service
 	if err := r.Get(ctx, req.NamespacedName, &svc); err != nil {
 		if errors.IsNotFound(err) {
-			_ = r.removeWatch(req.NamespacedName)
+			_ = r.removeWatch(ctx, req.NamespacedName)
 			return ctrl.Result{}, nil
 		}
 		return ctrl.Result{}, err
@@ -340,12 +292,8 @@ func (r *ScaleToZeroReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 		return ctrl.Result{RequeueAfter: 10 * time.Second}, nil
 	}
 	if ps == nil {
-		_ = r.removeWatch(req.NamespacedName)
+		_ = r.removeWatch(ctx, req.NamespacedName)
 		return ctrl.Result{}, nil
-	}
-
-	if err := r.cleanupStale(req.NamespacedName, ps.ip, ps.ports); err != nil {
-		return ctrl.Result{}, fmt.Errorf("cleanup stale BPF state: %w", err)
 	}
 
 	ready, err := r.countReadyEndpoints(ctx, svc.Namespace, svc.Name)
@@ -355,9 +303,9 @@ func (r *ScaleToZeroReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 	}
 	directScale := svc.Annotations[AnnotationDirectScale] == annotationTrue && ps.directScaleOpt
 
-	entries, rstSuppress, err := r.applyWatches(&svc, ps, ready, directScale)
-	if err != nil {
-		return ctrl.Result{}, err
+	entries, rstSuppress := r.buildEntries(&svc, ps, ready, directScale)
+	if err := r.pushFleet(ctx, req.NamespacedName, entries, rstSuppress); err != nil {
+		return ctrl.Result{}, fmt.Errorf("push agent fleet: %w", err)
 	}
 
 	logger.Info("reconciled",
@@ -376,8 +324,6 @@ func (r *ScaleToZeroReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 
 // detectTarget returns the kind (Deployment/StatefulSet) of the target workload
 // and whether the target itself opts into direct-scale via annotation.
-// Requiring the annotation on the target prevents annotation-based privilege escalation
-// from the Service side.
 func (r *ScaleToZeroReconciler) detectTarget(ctx context.Context, ns, name string) (string, bool, error) {
 	key := client.ObjectKey{Namespace: ns, Name: name}
 	reader := r.APIReader
@@ -402,77 +348,25 @@ func (r *ScaleToZeroReconciler) detectTarget(ctx context.Context, ns, name strin
 	return "", false, fmt.Errorf("no Deployment or StatefulSet named %q in namespace %q", name, ns)
 }
 
-// portSpec captures one Service TCP port (with optional NodePort).
 type portSpec struct {
 	port     uint16
 	nodePort int32
 }
 
-// cleanupStale removes old BPF state for any port that no longer matches the new
-// port set OR if the ClusterIP changed. Failure on any port returns an error so
-// the reconcile is requeued instead of installing a new watch on top of stale state.
-func (r *ScaleToZeroReconciler) cleanupStale(name types.NamespacedName, newIP net.IP, newPorts []portSpec) error {
-	r.mu.RLock()
-	prev := r.watches[name]
-	r.mu.RUnlock()
-	if len(prev) == 0 {
-		return nil
-	}
-
-	// Build a set of (port,nodePort) pairs for the new spec.
-	want := make(map[portSpec]struct{}, len(newPorts))
-	for _, p := range newPorts {
-		want[p] = struct{}{}
-	}
-
-	for _, e := range prev {
-		// Same ClusterIP and same (port,nodePort) pair: still valid, leave it.
-		if e.ClusterIP.Equal(newIP) {
-			if _, ok := want[portSpec{port: e.Port, nodePort: e.NodePort}]; ok {
-				continue
-			}
-		}
-		// Stale: remove the BPF state.
-		if err := r.BPF.RemoveWatch(e.ClusterIP, e.Port, e.NodePort); err != nil {
-			return err
-		}
-		r.mu.Lock()
-		r.indexRemoveLocked(e)
-		r.mu.Unlock()
-	}
-	return nil
-}
-
-// removeWatch detaches BPF state for every port owned by this Service, then
-// clears the in-memory entries only on success. Uses a pointer-equality check
-// against the current map value so that a concurrent reconcile that installed
-// a fresh entry list under the same NamespacedName is not erased.
-func (r *ScaleToZeroReconciler) removeWatch(name types.NamespacedName) error {
-	r.mu.RLock()
-	entries, ok := r.watches[name]
-	r.mu.RUnlock()
-	if !ok || len(entries) == 0 {
-		return nil
-	}
-	for _, e := range entries {
-		if err := r.BPF.RemoveWatch(e.ClusterIP, e.Port, e.NodePort); err != nil {
-			return err
-		}
-	}
+// removeWatch drops the Service's entries from the in-memory view and pushes
+// the updated spec to the fleet. Idempotent.
+func (r *ScaleToZeroReconciler) removeWatch(ctx context.Context, name types.NamespacedName) error {
 	r.mu.Lock()
-	if cur, ok := r.watches[name]; ok && len(cur) == len(entries) && cur[0] == entries[0] {
-		delete(r.watches, name)
-		for _, e := range entries {
-			r.indexRemoveLocked(e)
-		}
+	if _, ok := r.watches[name]; !ok {
+		r.mu.Unlock()
+		return nil
 	}
+	delete(r.watches, name)
 	r.mu.Unlock()
-	return nil
+	return r.Fleet.PushAll(ctx, r.buildSpecLocked(false))
 }
 
 // countReadyEndpoints returns the number of endpoints that are ready AND not terminating.
-// Returns an error on list failure so the reconciler can fail-closed (keep proxy_mode ON)
-// during transient API/cache issues.
 func (r *ScaleToZeroReconciler) countReadyEndpoints(ctx context.Context, ns, svcName string) (int, error) {
 	var list discoveryv1.EndpointSliceList
 	if err := r.List(ctx, &list, client.InNamespace(ns),
@@ -492,74 +386,10 @@ func (r *ScaleToZeroReconciler) countReadyEndpoints(ctx context.Context, ns, svc
 	return n, nil
 }
 
-// MetricsProvider returns the Provider for the Prometheus exporter.
-// Returns cumulative BPF SYN counts (summed across all ports of a Service).
-// Prometheus computes rate()/increase().
-func (r *ScaleToZeroReconciler) MetricsProvider() metrics.Provider {
-	logger := log.Log.WithName("metrics-provider")
-	return func() []metrics.ServiceMetric {
-		r.mu.RLock()
-		defer r.mu.RUnlock()
-		var out []metrics.ServiceMetric
-		for _, entries := range r.watches {
-			if len(entries) == 0 {
-				continue
-			}
-			var total uint64
-			for _, e := range entries {
-				count, err := r.BPF.ReadSynCount(e.BPFKey)
-				if err != nil {
-					logger.Error(err, "read syn_count",
-						"service", e.Namespace+"/"+e.Service, "port", e.Port)
-					continue
-				}
-				total += count
-			}
-			head := entries[0]
-			out = append(out, metrics.ServiceMetric{
-				Namespace: head.Namespace,
-				Service:   head.Service,
-				Count:     total,
-			})
-		}
-		return out
-	}
-}
-
-// LookupByBPFKey finds a watch entry matching the BPF destination via O(1)
-// reverse-index lookup. Matches either ClusterIP:port or *:nodePort
-// (for NodePort traffic). Returns nil if no match or if direct-scale is not enabled.
-func (r *ScaleToZeroReconciler) LookupByBPFKey(dstAddr uint32, dstPort uint16) *WatchEntry {
-	r.mu.RLock()
-	defer r.mu.RUnlock()
-
-	// ClusterIP-keyed lookup.
-	if e, ok := r.bpfKeyIndex[bpf.SvcKey{Addr: dstAddr, Port: dstPort}]; ok {
-		if !e.DirectScale {
-			return nil
-		}
-		cp := *e
-		return &cp
-	}
-	// NodePort-keyed lookup (port-only).
-	if e, ok := r.nodePortIndex[uint32(dstPort)]; ok {
-		if !e.DirectScale {
-			return nil
-		}
-		cp := *e
-		return &cp
-	}
-	return nil
-}
-
-// TriggerScale patches the target workload's /scale subresource to 1 ONLY if it is
-// currently at 0 replicas. Debounced per target.
-//
-// The target's kubewol/direct-scale annotation is re-checked against a non-cached
-// API read immediately before the patch: the Service-level annotation snapshot is
-// captured at reconcile time and is not sufficient as a live safety gate — a user
-// who has just removed the annotation from the workload must see fast-path scaling
-// stop immediately, not at the next Service/EndpointSlice event.
+// TriggerScale patches the target workload's /scale subresource to 1 only if it
+// is currently at 0. Debounced per target. The live annotation is re-checked
+// against the non-cached APIReader immediately before the patch so a
+// just-removed kubewol/direct-scale takes effect on the very next SYN event.
 func (r *ScaleToZeroReconciler) TriggerScale(ctx context.Context, namespace, kind, name string) {
 	key := namespace + "/" + kind + "/" + name
 
@@ -578,8 +408,6 @@ func (r *ScaleToZeroReconciler) TriggerScale(ctx context.Context, namespace, kin
 	logger := log.FromContext(ctx).WithName("direct-scale")
 	start := time.Now()
 
-	// Live annotation re-check. Uses APIReader (non-cached) so a just-removed
-	// annotation is observed immediately; the reconcile cache may lag.
 	if !r.isDirectScaleAllowed(ctx, namespace, kind, name) {
 		logger.V(1).Info("direct-scale denied by live annotation check", "target", key)
 		r.clearInflight(key)
@@ -595,8 +423,6 @@ func (r *ScaleToZeroReconciler) TriggerScale(ctx context.Context, namespace, kin
 		}
 	}
 
-	// Retry on Conflict so that cross-node races from multiple DaemonSet pods
-	// or concurrent HPA updates do not fail; re-read scale and re-check replicas==0.
 	alreadyScaled := false
 	err := retry.RetryOnConflict(retry.DefaultBackoff, func() error {
 		target := newTarget()
@@ -617,9 +443,6 @@ func (r *ScaleToZeroReconciler) TriggerScale(ctx context.Context, namespace, kin
 		r.clearInflight(key)
 		return
 	}
-	// Success path: keep the timestamp so subsequent SYN bursts within scaleDebounce
-	// are suppressed. Stale entries are pruned opportunistically at the top of
-	// TriggerScale so the map cannot grow without bound.
 	if alreadyScaled {
 		logger.V(1).Info("skipping direct-scale; already scaled", "target", key)
 		return
@@ -627,10 +450,9 @@ func (r *ScaleToZeroReconciler) TriggerScale(ctx context.Context, namespace, kin
 	logger.Info("scaled 0->1", "target", key, "duration", time.Since(start))
 }
 
-// isDirectScaleAllowed re-reads the target workload via the non-cached API reader
-// and returns true only if the kubewol/direct-scale annotation is still "true".
-// This is the live opt-out gate: removing the annotation from the Deployment or
-// StatefulSet takes effect on the very next SYN event, not at the next reconcile.
+// isDirectScaleAllowed re-reads the target workload via the non-cached API
+// reader and returns true only if the kubewol/direct-scale annotation is
+// still "true".
 func (r *ScaleToZeroReconciler) isDirectScaleAllowed(ctx context.Context, namespace, kind, name string) bool {
 	reader := r.APIReader
 	if reader == nil {
@@ -654,7 +476,6 @@ func (r *ScaleToZeroReconciler) isDirectScaleAllowed(ctx context.Context, namesp
 }
 
 // pruneInflightLocked drops scaleInflight entries older than scaleInflightGC.
-// Caller holds scaleMu.
 func (r *ScaleToZeroReconciler) pruneInflightLocked() {
 	cutoff := time.Now().Add(-scaleInflightGC)
 	for k, t := range r.scaleInflight {
@@ -674,12 +495,6 @@ func (r *ScaleToZeroReconciler) clearInflight(key string) {
 func (r *ScaleToZeroReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	if r.watches == nil {
 		r.watches = make(map[types.NamespacedName][]*WatchEntry)
-	}
-	if r.bpfKeyIndex == nil {
-		r.bpfKeyIndex = make(map[bpf.SvcKey]*WatchEntry)
-	}
-	if r.nodePortIndex == nil {
-		r.nodePortIndex = make(map[uint32]*WatchEntry)
 	}
 	if r.scaleInflight == nil {
 		r.scaleInflight = make(map[string]time.Time)

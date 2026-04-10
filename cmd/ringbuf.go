@@ -44,4 +44,4 @@ func (r *ringbufReader) ReadEvent() (bpf.SynEvent, error) {
 	return evt, nil
 }
 
-func (r *ringbufReader) Close() { _ = r.rd.Close() }
+func (r *ringbufReader) Close() error { return r.rd.Close() }

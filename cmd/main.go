@@ -11,6 +11,7 @@ import (
 	"context"
 	"flag"
 	"net"
+	"net/http"
 	"os"
 	"strings"
 	"time"
@@ -27,6 +28,8 @@ import (
 	metricsfilters "sigs.k8s.io/controller-runtime/pkg/metrics/filters"
 	metricsserver "sigs.k8s.io/controller-runtime/pkg/metrics/server"
 
+	"github.com/munenick/kubewol/internal/agent"
+	"github.com/munenick/kubewol/internal/agentapi"
 	"github.com/munenick/kubewol/internal/controller"
 	bpf "github.com/munenick/kubewol/internal/ebpf"
 	"github.com/munenick/kubewol/internal/metrics"
@@ -42,38 +45,61 @@ func init() {
 }
 
 func main() {
+	var mode string
 	var probeAddr string
 	var metricsAddr string
 	var remoteWriteURL string
 	var ifaceAllow string
 	var ifaceDeny string
+	var agentNamespace string
+	var agentService string
+	var agentPort int
 
+	flag.StringVar(&mode, "mode", "agent",
+		"Component to run. 'agent' loads eBPF and serves the agent HTTP API. "+
+			"'controller' runs the reconciler and the direct-scale fast path; "+
+			"it must be able to reach every agent over the pod network.")
 	flag.StringVar(&probeAddr, "health-probe-bind-address", ":8081", "Health probe bind address.")
 	flag.StringVar(&metricsAddr, "metrics-bind-address", ":8443",
-		"Prometheus /metrics bind address. Served over HTTPS with a self-signed "+
-			"certificate and gated by Kubernetes TokenReview / SubjectAccessReview; "+
-			"clients must present a ServiceAccount token bound to the "+
-			"kubewol-metrics-reader ClusterRole.")
+		"HTTPS metrics / agent-API bind address. Served by controller-runtime "+
+			"with TLS + TokenReview auth.")
 	flag.StringVar(&remoteWriteURL, "remote-write-url", "",
-		"Prometheus Remote Write URL (e.g. http://prometheus:9090/api/v1/write). "+
-			"When set, metrics are pushed immediately on SYN detection for fast cold start.")
+		"Prometheus Remote Write URL. Agent-only. When set, the agent pushes "+
+			"its local metrics snapshot on each direct-scale SYN for fast cold start.")
 	flag.StringVar(&ifaceAllow, "tc-iface-allow", "",
-		"Comma-separated interface name prefixes to attach TC programs to. "+
-			"Empty means attach to every non-loopback interface. Use this on CNIs "+
-			"that bridge traffic through an intermediate interface (e.g. 'cni0,eth0') "+
-			"to avoid double-counting SYN packets.")
+		"Agent-only. Comma-separated interface name prefixes to attach TC to.")
 	flag.StringVar(&ifaceDeny, "tc-iface-deny", "",
-		"Comma-separated interface name prefixes to EXCLUDE from TC attach. "+
-			"Evaluated after --tc-iface-allow.")
+		"Agent-only. Comma-separated interface name prefixes to exclude from TC attach.")
+	flag.StringVar(&agentNamespace, "agent-namespace", "kubewol-system",
+		"Controller-only. Namespace hosting the kubewol-agent headless Service.")
+	flag.StringVar(&agentService, "agent-service", "kubewol-agent",
+		"Controller-only. Name of the kubewol-agent headless Service.")
+	flag.IntVar(&agentPort, "agent-port", 8443,
+		"Controller-only. HTTPS port that the agent exposes.")
 
 	opts := zap.Options{Development: true}
 	opts.BindFlags(flag.CommandLine)
 	flag.Parse()
 	ctrl.SetLogger(zap.New(zap.UseFlagOptions(&opts)))
 
+	switch mode {
+	case "agent":
+		runAgent(probeAddr, metricsAddr, remoteWriteURL, ifaceAllow, ifaceDeny)
+	case "controller":
+		runController(probeAddr, metricsAddr, agentNamespace, agentService, agentPort)
+	default:
+		setupLog.Error(nil, "unknown --mode", "mode", mode)
+		os.Exit(1)
+	}
+}
+
+// ─────────────────────────────────────────
+// Agent entry point
+// ─────────────────────────────────────────
+
+func runAgent(probeAddr, metricsAddr, remoteWriteURL, ifaceAllow, ifaceDeny string) {
 	predicate := buildInterfacePredicate(ifaceAllow, ifaceDeny)
 
-	// eBPF
 	setupLog.Info("loading eBPF programs",
 		"ifaceAllow", ifaceAllow, "ifaceDeny", ifaceDeny)
 	bpfMgr, err := bpf.NewManager(bpf.Options{
@@ -87,14 +113,88 @@ func main() {
 	defer bpfMgr.Close()
 	setupLog.Info("eBPF programs loaded and attached")
 
-	// Controller manager: /metrics is served by controller-runtime over HTTPS,
-	// with TokenReview + SubjectAccessReview authn/z against the Kubernetes API.
-	// Scraping clients (Prometheus / Prometheus Adapter) must present a bearer
-	// token bound to the kubewol-metrics-reader ClusterRole.
-	//
-	// A self-signed certificate is generated in-memory at startup by the
-	// controller-runtime metrics server (no disk write, works with
-	// readOnlyRootFilesystem: true).
+	restConfig := ctrl.GetConfigOrDie()
+
+	// Build the agent (HTTP handlers + BPF state owner). Authentication and
+	// authorization for /v1/* is handled upstream by the custom metrics
+	// filter installed below, so the Agent does not need a Kubernetes
+	// client of its own.
+	ag := agent.New(bpfMgr, ctrl.Log.WithName("agent"))
+
+	// Extra handlers mounted on the controller-runtime metrics server so /v1/*
+	// paths get the same TLS + TokenReview auth that /metrics already has.
+	extra := map[string]http.Handler{}
+	agMux := http.NewServeMux()
+	ag.RegisterHandlers(agMux)
+	extra[agentapi.PathWatches] = agMux
+	extra[agentapi.PathSynEvents] = agMux
+
+	// Custom metrics filter provider: same shape as the upstream
+	// metricsfilters.WithAuthenticationAndAuthorization but with an explicit
+	// APIAudiences list so audience-bound projected tokens (the controller's
+	// kubewol.io/agent-api token) and ordinary SA tokens (Prometheus scrapers
+	// hitting /metrics) both pass the TokenReview step.
+	filterProvider := agent.KubewolFilterProvider("https://kubernetes.default.svc.cluster.local")
+
+	// controller-runtime manager: no reconcilers in agent mode; we only want
+	// the secure metrics server, the liveness probes, and the signal plumbing.
+	mgr, err := ctrl.NewManager(restConfig, ctrl.Options{
+		Scheme: scheme,
+		Metrics: metricsserver.Options{
+			BindAddress:    metricsAddr,
+			SecureServing:  true,
+			FilterProvider: filterProvider,
+			ExtraHandlers:  extra,
+		},
+		HealthProbeBindAddress: probeAddr,
+		LeaderElection:         false,
+	})
+	if err != nil {
+		setupLog.Error(err, "unable to start agent manager")
+		os.Exit(1)
+	}
+
+	if err := mgr.AddHealthzCheck("healthz", healthz.Ping); err != nil {
+		setupLog.Error(err, "unable to set up health check")
+		os.Exit(1)
+	}
+	if err := mgr.AddReadyzCheck("readyz", healthz.Ping); err != nil {
+		setupLog.Error(err, "unable to set up ready check")
+		os.Exit(1)
+	}
+
+	// Expose BPF metrics via the shared registry.
+	exporter := metrics.NewExporter(ag.ServiceMetrics, ag.DropCounts, remoteWriteURL)
+	if err := exporter.Register(ctrlmetrics.Registry); err != nil {
+		setupLog.Error(err, "unable to register eBPF exporter")
+		os.Exit(1)
+	}
+
+	ctx := ctrl.SetupSignalHandler()
+
+	// Dynamic TC attach for veth pairs created after startup.
+	go bpfMgr.WatchInterfaces(ctx, time.Second)
+
+	// Ring buffer → SSE emitter.
+	reader, err := newRingbufReader(bpfMgr.SynEventsMap())
+	if err != nil {
+		setupLog.Error(err, "failed to open ringbuf reader")
+		os.Exit(1)
+	}
+	go ag.RunRingBufReader(ctx, reader)
+
+	setupLog.Info("starting agent manager")
+	if err := mgr.Start(ctx); err != nil {
+		setupLog.Error(err, "problem running manager")
+		os.Exit(1)
+	}
+}
+
+// ─────────────────────────────────────────
+// Controller entry point
+// ─────────────────────────────────────────
+
+func runController(probeAddr, metricsAddr, agentNamespace, agentService string, agentPort int) {
 	mgr, err := ctrl.NewManager(ctrl.GetConfigOrDie(), ctrl.Options{
 		Scheme: scheme,
 		Metrics: metricsserver.Options{
@@ -103,19 +203,49 @@ func main() {
 			FilterProvider: metricsfilters.WithAuthenticationAndAuthorization,
 		},
 		HealthProbeBindAddress: probeAddr,
-		LeaderElection:         false, // DaemonSet, each pod runs independently
+		LeaderElection:         false,
 	})
 	if err != nil {
-		setupLog.Error(err, "unable to start manager")
+		setupLog.Error(err, "unable to start controller manager")
 		os.Exit(1)
 	}
 
+	// Placeholder reconciler: the Fleet is constructed before SetupWithManager
+	// so the reconcile loop has a push target from the very first event. The
+	// direct-scale handler is late-bound because it depends on the reconciler
+	// itself, which we are building right now.
 	reconciler := &controller.ScaleToZeroReconciler{
 		Client:    mgr.GetClient(),
 		APIReader: mgr.GetAPIReader(),
 		Scheme:    mgr.GetScheme(),
-		BPF:       bpfMgr,
 	}
+
+	// Bounded worker pool for direct-scale triggers.
+	scaleCh := make(chan scaleJob, 64)
+	for i := 0; i < 4; i++ {
+		go func() {
+			for job := range scaleCh {
+				reconciler.TriggerScale(context.Background(),
+					job.namespace, job.kind, job.name)
+			}
+		}()
+	}
+	handleSyn := func(ctx context.Context, evt agentapi.SynEventMsg) {
+		select {
+		case scaleCh <- scaleJob{namespace: evt.Namespace, kind: evt.TargetKind, name: evt.TargetName}:
+		default:
+			// Queue full — debounce already suppresses spam so drop is safe.
+		}
+	}
+
+	fleet := controller.NewFleet(
+		mgr.GetClient(),
+		ctrl.Log.WithName("fleet"),
+		agentNamespace, agentService, agentPort,
+		handleSyn,
+	)
+	reconciler.Fleet = fleet
+
 	if err := reconciler.SetupWithManager(mgr); err != nil {
 		setupLog.Error(err, "unable to create controller")
 		os.Exit(1)
@@ -130,36 +260,25 @@ func main() {
 		os.Exit(1)
 	}
 
-	// Register the eBPF exporter with controller-runtime's shared Prometheus
-	// registry so it is served by the authenticated /metrics endpoint above.
-	exporter := metrics.NewExporter(
-		reconciler.MetricsProvider(),
-		bpfMgr.DropCounts,
-		remoteWriteURL,
-	)
-	if err := exporter.Register(ctrlmetrics.Registry); err != nil {
-		setupLog.Error(err, "unable to register eBPF exporter")
-		os.Exit(1)
-	}
-
-	// Ring buffer reader: log SYN events + trigger Remote Write push + direct scale
 	ctx := ctrl.SetupSignalHandler()
-	go readSynEvents(ctx, bpfMgr, exporter, reconciler)
-	// Dynamic TC attach: Pods created after startup get new veth pairs and need
-	// programs attached to them or RST suppression is skipped for their traffic.
-	go bpfMgr.WatchInterfaces(ctx, time.Second)
+	// Fleet.Run needs the manager's cache so it can subscribe to
+	// EndpointSlice events via the informer already installed by the
+	// reconciler. A small safety ticker inside Run also re-refreshes
+	// every 60s to paper over any dropped event.
+	go fleet.Run(ctx, mgr.GetCache())
 
-	setupLog.Info("starting manager")
+	setupLog.Info("starting controller manager")
 	if err := mgr.Start(ctx); err != nil {
 		setupLog.Error(err, "problem running manager")
 		os.Exit(1)
 	}
 }
 
-// buildInterfacePredicate returns an interface filter for TC attach, honoring
-// the --tc-iface-allow and --tc-iface-deny prefix lists. Empty allow means
-// "match any non-loopback"; non-empty allow means "must have a matching prefix".
-// Deny is always applied after allow.
+// ─────────────────────────────────────────
+// Shared helpers
+// ─────────────────────────────────────────
+
+// buildInterfacePredicate returns an interface filter for TC attach.
 func buildInterfacePredicate(allowCSV, denyCSV string) func(net.Interface) bool {
 	allow := splitPrefixes(allowCSV)
 	deny := splitPrefixes(denyCSV)
@@ -203,81 +322,9 @@ func splitPrefixes(csv string) []string {
 	return out
 }
 
-// scaleJob is queued to the bounded worker pool when a SYN event hints
-// at a direct-scale opportunity.
+// scaleJob is enqueued to the bounded worker pool on every SSE SYN event.
 type scaleJob struct {
 	namespace string
 	kind      string
 	name      string
-}
-
-func readSynEvents(
-	ctx context.Context,
-	bpfMgr *bpf.Manager,
-	exporter *metrics.Exporter,
-	reconciler *controller.ScaleToZeroReconciler,
-) {
-	eventsMap := bpfMgr.SynEventsMap()
-	if eventsMap == nil {
-		return
-	}
-	logger := ctrl.Log.WithName("syn-events")
-
-	reader, err := newRingbufReader(eventsMap)
-	if err != nil {
-		logger.Error(err, "failed to create ringbuf reader")
-		return
-	}
-	defer reader.Close()
-	go func() { <-ctx.Done(); reader.Close() }()
-
-	// Bounded worker pool for direct-scale triggers. A small pool is enough because
-	// TriggerScale is debounced per-target and is short-lived (few ms in the hot path).
-	// A bounded buffered channel provides backpressure: if workers fall behind under
-	// a SYN burst, we drop redundant jobs rather than spawning unbounded goroutines.
-	const scaleWorkers = 4
-	const scaleQueueDepth = 64
-	scaleCh := make(chan scaleJob, scaleQueueDepth)
-	for i := 0; i < scaleWorkers; i++ {
-		go func() {
-			for job := range scaleCh {
-				reconciler.TriggerScale(ctx, job.namespace, job.kind, job.name)
-			}
-		}()
-	}
-	defer close(scaleCh)
-
-	logger.Info("ring buffer reader started")
-	for {
-		evt, err := reader.ReadEvent()
-		if err != nil {
-			return
-		}
-		logger.V(1).Info("SYN detected",
-			"src", bpf.Uint32ToIP(evt.SrcAddr).String(),
-			"srcPort", bpf.Ntohs(evt.SrcPort),
-			"dst", bpf.Uint32ToIP(evt.DstAddr).String(),
-			"dstPort", bpf.Ntohs(evt.DstPort))
-
-		// Push to Prometheus via Remote Write for fast cold start
-		if err := exporter.PushRemoteWrite(); err != nil {
-			logger.V(1).Info("remote write push failed", "error", err)
-		}
-
-		// Direct scale trigger (opt-in via kubewol/direct-scale annotation)
-		if entry := reconciler.LookupByBPFKey(evt.DstAddr, evt.DstPort); entry != nil {
-			select {
-			case scaleCh <- scaleJob{
-				namespace: entry.Namespace,
-				kind:      entry.TargetKind,
-				name:      entry.TargetName,
-			}:
-			default:
-				// Queue is full; a previous event for the same target is either
-				// in-flight or already debounced. Drop.
-				logger.V(1).Info("scale queue full, dropping SYN event",
-					"target", entry.Namespace+"/"+entry.TargetName)
-			}
-		}
-	}
 }

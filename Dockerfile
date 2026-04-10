@@ -11,13 +11,21 @@ RUN CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -a -o manager ./cmd/
 
 FROM alpine:3.21
 RUN apk add --no-cache ca-certificates libcap
+# Two copies of the same binary in the image:
+#   /manager       → setcap'd for the agent DaemonSet
+#   /manager-plain → no file caps, used by the controller Deployment
+#
+# File caps are needed by the agent: a non-root process that execs a binary
+# without file caps loses its effective capability set on exec, even if the
+# container runtime attached caps to the pod via SecurityContext.capabilities.
+# bpf(BPF_PROG_LOAD) then returns EPERM.
+#
+# But the controller is unprivileged (NoNewPrivs is implicit when
+# allowPrivilegeEscalation=false) and the kernel refuses to exec a binary
+# with file capabilities under NoNewPrivs unless those caps are in the
+# bounding set. The plain copy sidesteps that by having no file caps at all.
 COPY --from=builder /workspace/manager /manager
-# Grant the file caps needed for eBPF load + TC attach directly on the
-# binary so the process keeps them across exec when running as a non-root
-# UID (runAsUser: 65532). Without file caps, a non-root exec clears the
-# effective set even if SecurityContext.capabilities.add lists them, and
-# bpf(BPF_PROG_LOAD) returns EPERM.
+COPY --from=builder /workspace/manager /manager-plain
 RUN setcap cap_bpf,cap_net_admin=eip /manager
-# Run as the nonroot UID provided by distroless / nobody in alpine.
 USER 65532:65532
 ENTRYPOINT ["/manager"]

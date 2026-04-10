@@ -2,25 +2,61 @@ apiVersion: v1
 kind: Namespace
 metadata:
   labels:
-    control-plane: controller-manager
     app.kubernetes.io/name: kubewol
     app.kubernetes.io/managed-by: kustomize
   name: system
 ---
+# ─────────────────────────────────────────────────────────────────────────────
+# kubewol agent (DaemonSet)
+#
+# Owns the eBPF programs, the BPF maps and the ring buffer reader. Runs on
+# every node with hostNetwork + CAP_BPF + CAP_NET_ADMIN. Exposes the agent
+# HTTP API (PUT /v1/watches, GET /v1/syn-events) and a Prometheus /metrics
+# endpoint via controller-runtime's TLS + TokenReview server.
+# ─────────────────────────────────────────────────────────────────────────────
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: agent
+  namespace: system
+  labels:
+    app.kubernetes.io/name: kubewol
+    app.kubernetes.io/component: agent
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: agent
+  namespace: system
+  labels:
+    app.kubernetes.io/name: kubewol
+    app.kubernetes.io/component: agent
+spec:
+  # Headless Service so the controller can enumerate every agent Pod via
+  # EndpointSlice and open direct connections to each node's agent.
+  clusterIP: None
+  selector:
+    app.kubernetes.io/name: kubewol
+    app.kubernetes.io/component: agent
+  ports:
+    - name: https-metrics
+      port: 8443
+      targetPort: 8443
+      protocol: TCP
+---
 apiVersion: apps/v1
 kind: DaemonSet
 metadata:
-  name: controller-manager
+  name: agent
   namespace: system
   labels:
-    control-plane: controller-manager
     app.kubernetes.io/name: kubewol
-    app.kubernetes.io/managed-by: kustomize
+    app.kubernetes.io/component: agent
 spec:
   selector:
     matchLabels:
-      control-plane: controller-manager
       app.kubernetes.io/name: kubewol
+      app.kubernetes.io/component: agent
   template:
     metadata:
       annotations:
@@ -30,62 +66,44 @@ spec:
         prometheus.io/port: "8443"
         prometheus.io/path: "/metrics"
       labels:
-        control-plane: controller-manager
         app.kubernetes.io/name: kubewol
+        app.kubernetes.io/component: agent
     spec:
+      serviceAccountName: agent
       hostNetwork: true
       dnsPolicy: ClusterFirstWithHostNet
       tolerations:
         - operator: Exists
-      # Pod-level security: minimal, RuntimeDefault seccomp.
       securityContext:
         seccompProfile:
           type: RuntimeDefault
       containers:
-        - command:
-            - /manager
-          args:
-            - --health-probe-bind-address=:8081
-            - --metrics-bind-address=:8443
-            # Uncomment and configure to enable Remote Write push for fast cold start:
-            # - --remote-write-url=http://prometheus-server.monitoring.svc:80/api/v1/write
+        - name: manager
           image: controller:latest
           imagePullPolicy: IfNotPresent
-          name: manager
-          # hostPort is intentionally NOT declared. With hostNetwork: true the
-          # process binds the port directly in the host network namespace, so
-          # hostPort is redundant. /metrics is served over HTTPS and gated by
-          # Kubernetes TokenReview / SubjectAccessReview; scrapers must present
-          # a ServiceAccount token bound to kubewol-metrics-reader.
+          command:
+            - /manager
+          args:
+            - --mode=agent
+            - --health-probe-bind-address=:8081
+            - --metrics-bind-address=:8443
+            # Enable Remote Write push for fast cold start:
+            # - --remote-write-url=http://prometheus-server.monitoring.svc:80/api/v1/write
           ports:
             - containerPort: 8443
               name: https-metrics
             - containerPort: 8081
               name: healthz
-          # Container-level security: drop privileged and grant only the
-          # minimal capabilities needed for eBPF TC attach and map operations.
-          #
-          # - CAP_BPF: load eBPF programs, create/update BPF maps
-          # - CAP_NET_ADMIN: attach TC (tcx) hooks to network interfaces
-          #
-          # CAP_PERFMON used to be required because bpf/monitor.c walked
-          # packet data with direct pointer arithmetic, which the verifier
-          # classifies as privileged. The programs now read every packet
-          # field with bpf_skb_load_bytes() and scalar offsets, so CAP_BPF
-          # + CAP_NET_ADMIN is enough.
-          #
-          # CAP_SYS_RESOURCE was previously added to raise RLIMIT_MEMLOCK on
-          # kernels <5.11. This project targets kernel 6.6+ (TCX), where BPF
-          # memory accounting is cgroup-based and CAP_BPF already bypasses
-          # the memlock rlimit, so the capability is no longer required.
+          # CAP_BPF: load eBPF programs, create/update BPF maps.
+          # CAP_NET_ADMIN: attach TC (tcx) hooks to network interfaces.
+          # PERFMON / SYS_RESOURCE are NOT required: the BPF program avoids
+          # pointer arithmetic on packet data (bpf_skb_load_bytes only) and
+          # kernel 6.6+ lets CAP_BPF bypass the memlock rlimit. See
+          # bpf/monitor.c for the verifier-friendly rewrite.
           securityContext:
             privileged: false
             allowPrivilegeEscalation: false
             readOnlyRootFilesystem: true
-            # eBPF load/attach is gated on file capabilities, not UID: with
-            # CAP_BPF + CAP_NET_ADMIN (+ CAP_PERFMON) a non-root user can
-            # bpf(BPF_PROG_LOAD) and AttachTCX just fine. Running as an
-            # unprivileged user shrinks the blast radius of a container escape.
             runAsNonRoot: true
             runAsUser: 65532
             runAsGroup: 65532
@@ -114,5 +132,145 @@ spec:
             requests:
               cpu: 10m
               memory: 64Mi
-      serviceAccountName: controller-manager
+      terminationGracePeriodSeconds: 10
+---
+# ─────────────────────────────────────────────────────────────────────────────
+# kubewol controller (Deployment)
+#
+# Runs the Kubernetes API reconcile loop, discovers agents via the headless
+# Service above, pushes WatchSpec snapshots to each agent, and triggers
+# direct-scale on SYN events streamed back over SSE. Zero privileges: no
+# hostNetwork, no capabilities, no root, no BPF access.
+# ─────────────────────────────────────────────────────────────────────────────
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: controller
+  namespace: system
+  labels:
+    app.kubernetes.io/name: kubewol
+    app.kubernetes.io/component: controller
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: controller
+  namespace: system
+  labels:
+    app.kubernetes.io/name: kubewol
+    app.kubernetes.io/component: controller
+spec:
+  selector:
+    app.kubernetes.io/name: kubewol
+    app.kubernetes.io/component: controller
+  ports:
+    - name: https-metrics
+      port: 8443
+      targetPort: 8443
+      protocol: TCP
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: controller
+  namespace: system
+  labels:
+    app.kubernetes.io/name: kubewol
+    app.kubernetes.io/component: controller
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: kubewol
+      app.kubernetes.io/component: controller
+  template:
+    metadata:
+      annotations:
+        kubectl.kubernetes.io/default-container: manager
+        prometheus.io/scrape: "true"
+        prometheus.io/scheme: "https"
+        prometheus.io/port: "8443"
+        prometheus.io/path: "/metrics"
+      labels:
+        app.kubernetes.io/name: kubewol
+        app.kubernetes.io/component: controller
+    spec:
+      serviceAccountName: controller
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+        runAsGroup: 65532
+        seccompProfile:
+          type: RuntimeDefault
+      volumes:
+        # Audience-bound projected ServiceAccount token. The token's aud
+        # claim is kubewol.io/agent-api, which the agent enforces via a
+        # TokenReview with matching spec.audiences. A bearer token stolen
+        # from a compromised network path can therefore only be replayed
+        # against kubewol agents, not against kube-apiserver or any other
+        # audience-unchecked in-cluster service.
+        - name: agent-api-token
+          projected:
+            sources:
+              - serviceAccountToken:
+                  audience: kubewol.io/agent-api
+                  expirationSeconds: 3600
+                  path: token
+      containers:
+        - name: manager
+          image: controller:latest
+          imagePullPolicy: IfNotPresent
+          command:
+            # Use the non-setcap copy: NoNewPrivs (implied by
+            # allowPrivilegeEscalation: false) makes the kernel refuse exec of
+            # a binary that has file capabilities unless those caps are in the
+            # bounding set — which this unprivileged pod deliberately does not
+            # grant. /manager-plain is a byte-identical copy without setcap.
+            - /manager-plain
+          args:
+            - --mode=controller
+            - --health-probe-bind-address=:8081
+            - --metrics-bind-address=:8443
+            - --agent-namespace=$(POD_NAMESPACE)
+            - --agent-service=kubewol-agent
+            - --agent-port=8443
+          volumeMounts:
+            - name: agent-api-token
+              mountPath: /var/run/secrets/kubewol/agent-api
+              readOnly: true
+          env:
+            - name: POD_NAMESPACE
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.namespace
+          ports:
+            - containerPort: 8443
+              name: https-metrics
+            - containerPort: 8081
+              name: healthz
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop:
+                - ALL
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: 8081
+            initialDelaySeconds: 5
+            periodSeconds: 20
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: 8081
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          resources:
+            limits:
+              cpu: 200m
+              memory: 128Mi
+            requests:
+              cpu: 10m
+              memory: 64Mi
       terminationGracePeriodSeconds: 10
