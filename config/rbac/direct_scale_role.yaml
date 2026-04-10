@@ -1,18 +1,33 @@
 ---
 # ClusterRole for the direct-scale fast path.
 #
+# THREAT MODEL:
 # This role grants write access to the /scale subresource on Deployments and
-# StatefulSets across the cluster. It is NOT applied by default because that
-# is a significant privilege: a compromise of the controller pod yields the
-# ability to scale any workload in the cluster.
+# StatefulSets cluster-wide. The kubewol DaemonSet runs on every node, so a
+# compromise of any node-local pod yields cluster-wide scale authority over
+# every Deployment and StatefulSet.
 #
-# Apply this only if you want direct-scale (sub-second 0->1 trigger).
-# Without it, kubewol still observes traffic and feeds Prometheus metrics to
-# HPA, which handles scaling with normal HPA credentials.
+# In-process annotation checks (kubewol/direct-scale on both the Service and
+# the target workload) reduce ACCIDENTAL misuse by legitimate operators, but
+# they are not a security boundary against an attacker who has code execution
+# in the controller pod.
+#
+# Mitigations to consider before applying this in production:
+#   1. Skip direct-scale entirely. The default kubewol install only observes
+#      traffic and feeds metrics to HPA, which uses normal HPA credentials.
+#      Cold start is ~19s instead of ~3s.
+#   2. Restrict the binding to specific namespaces by replacing this
+#      ClusterRoleBinding with namespace-scoped RoleBindings, and run a
+#      separate kubewol install per scope. The ClusterRole itself can stay,
+#      but the binding only grants the privilege within the bound namespaces.
+#   3. Use ValidatingAdmissionPolicy to restrict which workloads the
+#      kubewol ServiceAccount may patch.
+#
+# Without this role applied, TriggerScale calls will fail with a forbidden
+# error and kubewol falls back to HPA-only behavior.
 #
 # Usage:
 #   kubectl apply -f https://.../direct_scale_role.yaml
-#   kubectl apply -f https://.../direct_scale_role_binding.yaml
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRole
 metadata:

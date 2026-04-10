@@ -67,16 +67,25 @@ jobs:
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
 
-      - name: Generate install manifest
+      - name: Generate release manifests
         run: |
           IMAGE_LC=$(echo "${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}" | tr '[:upper:]' '[:lower:]')
           VERSION="${GITHUB_REF_NAME#v}"
           cd config/manager && kustomize edit set image controller="${IMAGE_LC}:${VERSION}"
           cd ../..
+          # 1. Default install (observation only, no direct-scale RBAC).
           kustomize build config/default > install.yaml
+          # 2. Optional direct-scale ClusterRole + ClusterRoleBinding.
+          cp config/rbac/direct_scale_role.yaml direct-scale-role.yaml
+          # 3. Optional NetworkPolicy that restricts /metrics to namespaces
+          #    labeled kubewol-metrics=scraper.
+          cp config/network-policy/allow-metrics-traffic.yaml metrics-network-policy.yaml
 
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:
           generate_release_notes: true
-          files: install.yaml
+          files: |
+            install.yaml
+            direct-scale-role.yaml
+            metrics-network-policy.yaml

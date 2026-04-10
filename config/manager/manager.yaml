@@ -51,10 +51,14 @@ spec:
           image: controller:latest
           imagePullPolicy: IfNotPresent
           name: manager
+          # Note: hostPort is intentionally NOT declared. With hostNetwork: true the
+          # process binds the port directly in the host network namespace, so hostPort
+          # is redundant and only inflates the apparent attack surface. The /metrics
+          # endpoint is unauthenticated; restrict access via the provided NetworkPolicy
+          # at config/network-policy/allow-metrics-traffic.yaml.
           ports:
             - containerPort: 9090
               name: metrics
-              hostPort: 9090
             - containerPort: 8081
               name: healthz
           # Container-level security: drop privileged and grant only the
