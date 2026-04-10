@@ -173,20 +173,41 @@ Useful when:
 
 ## Securing the metrics endpoint
 
-The DaemonSet binds `/metrics` to port 9090 on every node (via `hostNetwork: true`). The endpoint is unauthenticated; anything on the node network can scrape service names and SYN counts unless restricted. Apply the provided NetworkPolicy and label your Prometheus namespace:
+The DaemonSet binds `/metrics` to port **8443** on every node (via `hostNetwork: true`) and serves it over HTTPS with a self-signed certificate generated in-memory at startup. Requests are gated by Kubernetes **TokenReview + SubjectAccessReview**: clients must present a ServiceAccount bearer token bound to the `kubewol-metrics-reader` ClusterRole.
+
+Prometheus scrape config (ServiceMonitor / static):
+
+```yaml
+scheme: https
+tlsConfig:
+  insecureSkipVerify: true  # cert is self-signed
+authorization:
+  type: Bearer
+  credentials:
+    # /var/run/secrets/kubernetes.io/serviceaccount/token inside the scrape Pod
+    file: /var/run/secrets/kubernetes.io/serviceaccount/token
+```
+
+Grant the scraper's ServiceAccount access:
+
+```bash
+kubectl create clusterrolebinding prom-kubewol \
+  --clusterrole=kubewol-metrics-reader \
+  --serviceaccount=monitoring:prometheus
+```
+
+As defense-in-depth on CNIs that honor NetworkPolicy for host-networked pods (e.g. Calico), the release bundle also ships a NetworkPolicy that restricts ingress to port 8443 from namespaces labeled `kubewol-metrics=scraper`:
 
 ```bash
 kubectl apply -f https://github.com/munenick/kubewol/releases/latest/download/metrics-network-policy.yaml
 kubectl label ns monitoring kubewol-metrics=scraper
 ```
 
-Only pods in namespaces labeled `kubewol-metrics=scraper` will be able to reach port 9090.
-
 ## Flags
 
 | Flag | Default | Description |
 |---|---|---|
-| `--metrics-bind-address` | `:9090` | Prometheus /metrics bind address |
+| `--metrics-bind-address` | `:8443` | Prometheus /metrics bind address (HTTPS, TokenReview-gated) |
 | `--health-probe-bind-address` | `:8081` | Health probe bind address |
 | `--remote-write-url` | (disabled) | Prometheus Remote Write URL for fast cold start push (e.g. `http://prometheus:9090/api/v1/write`) |
 | `--tc-iface-allow` | (empty = all non-loopback) | Comma-separated interface name prefixes to attach TC to. Use on bridge-based CNIs (e.g. `cni0,eth0`) if SYN counts double-count. |
