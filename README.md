@@ -143,22 +143,43 @@ The target workload kind (`Deployment` or `StatefulSet`) is auto-detected. Both 
 
 By default, kubewol is a pure Prometheus exporter and HPA handles all scaling decisions. Cold start is ~19s (dominated by HPA 15s sync period).
 
-Setting `kubewol/direct-scale=true` on the Service enables a fast path:
+Setting `kubewol/direct-scale=true` on **both** the Service AND the target workload enables a fast path:
 
 ```bash
 kubectl annotate svc my-app kubewol/direct-scale=true
+kubectl annotate deploy my-app kubewol/direct-scale=true
 ```
 
-- On SYN detection, kubewol directly patches `deployments/scale` (0→1) via the K8s API
-- Cold start drops from ~19s to **~1s**
+Requiring the annotation on the target workload too prevents privilege escalation: a user who can only mutate Services cannot redirect kubewol to patch arbitrary workloads.
+
+- On SYN detection, kubewol reads the current scale and patches `deployments/scale` or `statefulsets/scale` to **1 only if currently at 0**. Existing replicas from HPA or manual scale-up are never clobbered. Conflict errors (races between nodes or with HPA) are retried.
+- Cold start drops from ~19s to **~3s**
 - HPA still handles 1→N and N→0 (kubewol only triggers 0→1)
-- Requires RBAC write on `deployments/scale` (already included)
-- Can coexist with HPA; direct scale wins the race to 1, then HPA takes over
+- Coexists with HPA: kubewol wins the race to 1, then HPA takes over
+
+**This fast path requires an opt-in ClusterRole** because the controller needs cluster-wide write on `deployments/scale` and `statefulsets/scale`. The default install does NOT include this. Apply it explicitly:
+
+```bash
+kubectl apply -f https://github.com/munenick/kubewol/releases/latest/download/direct-scale-role.yaml
+```
+
+Without this role, kubewol still observes traffic and feeds metrics to HPA, but `TriggerScale` calls will fail with `forbidden`.
 
 Useful when:
 - You want the absolute fastest cold start
 - You can't install Prometheus + Adapter (kubewol works standalone for 0→1)
 - You need to avoid KEDA's External Metrics API conflict
+
+## Securing the metrics endpoint
+
+The DaemonSet binds `/metrics` to `hostPort: 9090` on every node. Anything on the node network can scrape service names and SYN counts unless restricted. Apply the provided NetworkPolicy and label your Prometheus namespace:
+
+```bash
+kubectl apply -f config/network-policy/allow-metrics-traffic.yaml
+kubectl label ns monitoring kubewol-metrics=scraper
+```
+
+Only pods in namespaces labeled `kubewol-metrics=scraper` will be able to reach port 9090.
 
 ## Flags
 
@@ -273,6 +294,7 @@ In HPA mode, the dominant bottleneck is the **HPA 15s sync period**. This is not
 
 ### Limitations
 
+- **IPv4 only.** The TC eBPF programs parse IPv4 headers only. IPv6 and dual-stack Services are explicitly skipped (logged as `skipping non-IPv4 service`).
 - **HPA evaluation frequency** is global, not per-HPA
 - **TCP SYN retransmit backoff** is kernel-level (1, 2, 4, 8, 16s intervals); after Pod is ready, the client waits for its next scheduled retransmit
 - **kube-proxy endpoint propagation** adds delay between Pod Ready and iptables/ipvs rule update
