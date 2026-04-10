@@ -11,6 +11,7 @@ import (
 	"context"
 	"net"
 	"sync"
+	"time"
 
 	corev1 "k8s.io/api/core/v1"
 	discoveryv1 "k8s.io/api/discovery/v1"
@@ -38,14 +39,15 @@ const (
 
 // WatchEntry tracks BPF state for one Service.
 type WatchEntry struct {
-	Namespace  string
-	Service    string
-	Deployment string
-	ClusterIP  net.IP
-	Port       uint16
-	NodePort   int32
-	BPFKey     bpf.SvcKey
-	ProxyMode  bool
+	Namespace    string
+	Service      string
+	Deployment   string
+	ClusterIP    net.IP
+	Port         uint16
+	NodePort     int32
+	BPFKey       bpf.SvcKey
+	ProxyMode    bool
+	ReadySince   time.Time // when endpoints first became ready (zero = not ready)
 }
 
 // ScaleToZeroReconciler reconciles Services annotated with kubewol/enabled=true.
@@ -107,20 +109,45 @@ func (r *ScaleToZeroReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 	}
 
 	ready := r.countReadyEndpoints(ctx, svc.Namespace, svc.Name)
-	proxyMode := ready == 0
-	r.BPF.SetProxyMode(bpfKey, proxyMode, nodePort)
+
+	// Delay proxy_mode OFF by propagationDelay to let kube-proxy update iptables/ipvs.
+	// Without this, a SYN retransmit can slip through before DNAT rules are ready,
+	// causing iptables REJECT → RST → browser ERR_NETWORK_CHANGED.
+	const propagationDelay = 5 * time.Second
 
 	r.mu.Lock()
+	prev, exists := r.watches[req.NamespacedName]
+	var readySince time.Time
+	if exists {
+		readySince = prev.ReadySince
+	}
+
+	if ready == 0 {
+		readySince = time.Time{} // reset
+	} else if readySince.IsZero() {
+		readySince = time.Now() // first ready
+	}
+
+	proxyMode := ready == 0 || time.Since(readySince) < propagationDelay
+	r.BPF.SetProxyMode(bpfKey, proxyMode, nodePort)
+
 	r.watches[req.NamespacedName] = &WatchEntry{
 		Namespace: svc.Namespace, Service: svc.Name,
 		Deployment: deployName, ClusterIP: ip, Port: port,
 		NodePort: nodePort, BPFKey: bpfKey, ProxyMode: proxyMode,
+		ReadySince: readySince,
 	}
 	r.mu.Unlock()
 
 	logger.Info("reconciled",
 		"service", svc.Name, "clusterIP", svc.Spec.ClusterIP,
-		"port", port, "nodePort", nodePort, "proxyMode", proxyMode)
+		"port", port, "nodePort", nodePort,
+		"proxyMode", proxyMode, "readyEndpoints", ready)
+
+	// If we're in the propagation delay, requeue to turn off proxy_mode after the delay.
+	if proxyMode && ready > 0 {
+		return ctrl.Result{RequeueAfter: propagationDelay}, nil
+	}
 
 	return ctrl.Result{}, nil
 }
