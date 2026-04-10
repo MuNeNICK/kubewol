@@ -73,7 +73,7 @@ rules:
       name:
         matches: "^(.*)$"
         as: "${1}"
-      metricsQuery: 'sum(increase(<<.Series>>{<<.LabelMatchers>>}[2m]))'
+      metricsQuery: 'sum(rate(<<.Series>>{<<.LabelMatchers>>}[1m])) or vector(0)'
 ```
 
 ### 3. Create an HPA with `minReplicas: 0`
@@ -97,10 +97,10 @@ spec:
           name: ebpf_service_syn_total
         target:
           type: Value
-          value: "1"
+          value: "100m"
   behavior:
     scaleDown:
-      stabilizationWindowSeconds: 30
+      stabilizationWindowSeconds: 10
       policies:
         - type: Percent
           value: 100
