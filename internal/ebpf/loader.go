@@ -3,12 +3,14 @@ package ebpf
 
 import (
 	"bytes"
+	"context"
 	_ "embed"
 	"encoding/binary"
 	"errors"
 	"fmt"
 	"net"
 	"sync"
+	"time"
 	"unsafe"
 
 	"github.com/cilium/ebpf"
@@ -34,6 +36,22 @@ var requiredMaps = []string{
 	"nodeport_rst_suppress",
 	"nodeport_to_svc",
 	"syn_events",
+	"drop_count",
+}
+
+// DropReason indexes into the drop_count BPF PERCPU_ARRAY. The values must
+// match the #define block in bpf/monitor.c.
+type DropReason uint32
+
+const (
+	DropReasonSynCountUpdate DropReason = 0
+	DropReasonRingbufReserve DropReason = 1
+)
+
+// dropReasonNames is the label used in Prometheus for each reason.
+var dropReasonNames = map[DropReason]string{
+	DropReasonSynCountUpdate: "syn_count_update",
+	DropReasonRingbufReserve: "ringbuf_reserve",
 }
 
 // SvcKey matches struct svc_key in monitor.c.
@@ -62,10 +80,14 @@ type Options struct {
 
 // Manager handles eBPF program loading, interface attachment, and map operations.
 type Manager struct {
-	coll   *ebpf.Collection
-	links  []link.Link
-	logger logr.Logger
-	mu     sync.Mutex
+	coll      *ebpf.Collection
+	links     []link.Link
+	logger    logr.Logger
+	mu        sync.Mutex
+	predicate func(net.Interface) bool
+	// attached tracks interface index -> nil once both directions are attached.
+	// Used by WatchInterfaces to skip interfaces already covered.
+	attached map[int]struct{}
 
 	// Cached map handles. Set once in NewManager after verifying all required
 	// maps are present. Eliminates nil-pointer panics from map name drift.
@@ -78,6 +100,7 @@ type Manager struct {
 		nodeportRstSuppress *ebpf.Map
 		nodeportToSvc       *ebpf.Map
 		synEvents           *ebpf.Map
+		dropCount           *ebpf.Map
 	}
 }
 
@@ -101,7 +124,12 @@ func NewManager(opts Options) (*Manager, error) {
 		}
 	}
 
-	m := &Manager{coll: coll, logger: opts.Logger}
+	m := &Manager{
+		coll:      coll,
+		logger:    opts.Logger,
+		predicate: opts.InterfacePredicate,
+		attached:  make(map[int]struct{}),
+	}
 	m.m.watchSvc = coll.Maps["watch_svc"]
 	m.m.synCount = coll.Maps["syn_count"]
 	m.m.proxyMode = coll.Maps["proxy_mode"]
@@ -110,8 +138,9 @@ func NewManager(opts Options) (*Manager, error) {
 	m.m.nodeportRstSuppress = coll.Maps["nodeport_rst_suppress"]
 	m.m.nodeportToSvc = coll.Maps["nodeport_to_svc"]
 	m.m.synEvents = coll.Maps["syn_events"]
+	m.m.dropCount = coll.Maps["drop_count"]
 
-	if err := m.attachAll(opts.InterfacePredicate); err != nil {
+	if err := m.attachAll(); err != nil {
 		coll.Close()
 		return nil, err
 	}
@@ -119,57 +148,104 @@ func NewManager(opts Options) (*Manager, error) {
 }
 
 // attachAll attaches ingress AND egress TC programs to every selected non-loopback
-// interface. An interface is only counted as "attached" when BOTH directions succeed,
-// because the stated design (preserve TCP connection during scale-from-zero) requires
-// both SYN DROP on ingress and RST suppression on egress.
+// interface currently present. Startup mode: requires at least one interface to
+// attach successfully. Subsequent runs via WatchInterfaces are best-effort.
+func (m *Manager) attachAll() error {
+	attached, err := m.attachNewInterfaces()
+	if err != nil {
+		return err
+	}
+	if attached == 0 {
+		return fmt.Errorf("could not attach to any interface (ingress+egress required)")
+	}
+	return nil
+}
+
+// attachNewInterfaces scans the current interface list and attaches TC programs
+// to any interface that matches the predicate and is not already attached.
+// Returns the number of interfaces attached in this call.
 //
-// Attach failures are logged but do not abort startup as long as at least one
-// interface is fully attached.
-func (m *Manager) attachAll(predicate func(net.Interface) bool) error {
+// This is the entry point for both startup attach and dynamic attach of veth
+// pairs created after kubewol starts. Without dynamic attach, a Pod created
+// after startup would have no RST suppression on its veth: kube-proxy REJECT
+// for a scaled-to-zero Service would deliver a TCP RST back to the new Pod
+// via a veth that has no egress filter, and the cold-start behaviour breaks.
+func (m *Manager) attachNewInterfaces() (int, error) {
 	ifaces, err := net.Interfaces()
 	if err != nil {
-		return fmt.Errorf("list interfaces: %w", err)
+		return 0, fmt.Errorf("list interfaces: %w", err)
 	}
 	ingressProg := m.coll.Programs["traffic_monitor"]
 	if ingressProg == nil {
-		return fmt.Errorf("bpf program 'traffic_monitor' not found")
+		return 0, fmt.Errorf("bpf program 'traffic_monitor' not found")
 	}
 	egressProg := m.coll.Programs["egress_rst_filter"]
 	if egressProg == nil {
-		return fmt.Errorf("bpf program 'egress_rst_filter' not found")
+		return 0, fmt.Errorf("bpf program 'egress_rst_filter' not found")
 	}
+
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
 	attached := 0
 	for _, iface := range ifaces {
 		if iface.Flags&net.FlagLoopback != 0 {
 			continue
 		}
-		if predicate != nil && !predicate(iface) {
+		if m.predicate != nil && !m.predicate(iface) {
+			continue
+		}
+		if _, ok := m.attached[iface.Index]; ok {
 			continue
 		}
 		li, err := link.AttachTCX(link.TCXOptions{
 			Interface: iface.Index, Program: ingressProg, Attach: ebpf.AttachTCXIngress,
 		})
 		if err != nil {
-			m.logger.Info("TC ingress attach failed", "iface", iface.Name, "error", err.Error())
+			m.logger.V(1).Info("TC ingress attach failed", "iface", iface.Name, "error", err.Error())
 			continue
 		}
 		le, err := link.AttachTCX(link.TCXOptions{
 			Interface: iface.Index, Program: egressProg, Attach: ebpf.AttachTCXEgress,
 		})
 		if err != nil {
-			m.logger.Info("TC egress attach failed, rolling back ingress",
+			m.logger.V(1).Info("TC egress attach failed, rolling back ingress",
 				"iface", iface.Name, "error", err.Error())
 			_ = li.Close()
 			continue
 		}
 		m.links = append(m.links, li, le)
-		m.logger.Info("TC attached", "iface", iface.Name)
+		m.attached[iface.Index] = struct{}{}
+		m.logger.Info("TC attached", "iface", iface.Name, "index", iface.Index)
 		attached++
 	}
-	if attached == 0 {
-		return fmt.Errorf("could not attach to any interface (ingress+egress required)")
+	return attached, nil
+}
+
+// WatchInterfaces polls for new interfaces and attaches TC programs to them.
+// Run this as a goroutine for the lifetime of the process.
+//
+// Polling is used instead of netlink RTM_NEWLINK because a 1s poll is cheap
+// (one getifaddrs syscall) and avoids a new dependency. A newly-created Pod's
+// RST-suppression coverage gap is at most one poll interval, which is well
+// below the kernel's ~1s first TCP SYN retransmit, so the client still sees
+// a transparent cold start as long as the attach happens within that window.
+func (m *Manager) WatchInterfaces(ctx context.Context, interval time.Duration) {
+	if interval <= 0 {
+		interval = time.Second
 	}
-	return nil
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			if _, err := m.attachNewInterfaces(); err != nil {
+				m.logger.V(1).Info("dynamic attach scan failed", "error", err.Error())
+			}
+		}
+	}
 }
 
 // Close detaches all programs and closes the collection.
@@ -302,27 +378,64 @@ func (m *Manager) setDual(
 	}
 	npKey := uint32(Htons(uint16(nodePort)))
 
-	// Update the NodePort-keyed entry; roll back the IP entry on failure.
+	rollback := func() error {
+		if hadPrior {
+			if err := ipMap.Update(key, prior, ebpf.UpdateAny); err != nil {
+				return fmt.Errorf("rollback %s: %w", ipMapName, err)
+			}
+			return nil
+		}
+		if err := ipMap.Delete(key); err != nil && !errors.Is(err, ebpf.ErrKeyNotExist) {
+			return fmt.Errorf("rollback %s: %w", ipMapName, err)
+		}
+		return nil
+	}
+
+	// Update the NodePort-keyed entry; roll back the IP entry on failure and
+	// surface BOTH the original error and any rollback failure to the caller.
 	if enabled {
 		if err := npMap.Update(npKey, uint8(1), ebpf.UpdateAny); err != nil {
-			// Roll back IP entry.
-			if hadPrior {
-				_ = ipMap.Update(key, prior, ebpf.UpdateAny)
-			} else {
-				_ = ipMap.Delete(key)
+			origErr := fmt.Errorf("update %s: %w", npMapName, err)
+			if rerr := rollback(); rerr != nil {
+				return errors.Join(origErr, rerr)
 			}
-			return fmt.Errorf("update %s: %w", npMapName, err)
+			return origErr
 		}
 		return nil
 	}
 	if err := npMap.Delete(npKey); err != nil && !errors.Is(err, ebpf.ErrKeyNotExist) {
-		// Roll back IP entry.
-		if hadPrior {
-			_ = ipMap.Update(key, prior, ebpf.UpdateAny)
+		origErr := fmt.Errorf("delete %s: %w", npMapName, err)
+		if rerr := rollback(); rerr != nil {
+			return errors.Join(origErr, rerr)
 		}
-		return fmt.Errorf("delete %s: %w", npMapName, err)
+		return origErr
 	}
 	return nil
+}
+
+// DropCounts reads the per-reason PERCPU_ARRAY and returns a label->count
+// map suitable for Prometheus export. A missing map yields an empty result.
+func (m *Manager) DropCounts() (map[string]uint64, error) {
+	out := map[string]uint64{}
+	if m.m.dropCount == nil {
+		return out, nil
+	}
+	for reason, label := range dropReasonNames {
+		var perCPU []uint64
+		key := uint32(reason)
+		if err := m.m.dropCount.Lookup(key, &perCPU); err != nil {
+			if errors.Is(err, ebpf.ErrKeyNotExist) {
+				continue
+			}
+			return nil, fmt.Errorf("lookup drop_count[%s]: %w", label, err)
+		}
+		var total uint64
+		for _, v := range perCPU {
+			total += v
+		}
+		out[label] = total
+	}
+	return out, nil
 }
 
 // ReadSynCount reads the cumulative SYN count for a key. Returns (count, error).

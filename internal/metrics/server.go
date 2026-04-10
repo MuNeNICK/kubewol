@@ -27,24 +27,38 @@ type ServiceMetric struct {
 // Provider is called to get current metrics.
 type Provider func() []ServiceMetric
 
+// DropProvider returns per-reason BPF drop counts (label -> total).
+// Kernel side increments drop_count[] via drop_inc() when a BPF map update
+// or ringbuf reserve fails; this surfaces those otherwise-silent failures.
+type DropProvider func() (map[string]uint64, error)
+
 // Exporter exposes Prometheus /metrics and pushes via Remote Write on demand.
 type Exporter struct {
 	provider       Provider
+	dropProvider   DropProvider
 	remoteWriteURL string
 	desc           *prometheus.Desc
+	dropDesc       *prometheus.Desc
 	pushMu         sync.Mutex
 }
 
 // NewExporter creates a Prometheus exporter.
 // remoteWriteURL can be empty to disable Remote Write push.
-func NewExporter(provider Provider, remoteWriteURL string) *Exporter {
+// dropProvider can be nil to skip exporting BPF drop counters.
+func NewExporter(provider Provider, dropProvider DropProvider, remoteWriteURL string) *Exporter {
 	return &Exporter{
 		provider:       provider,
+		dropProvider:   dropProvider,
 		remoteWriteURL: remoteWriteURL,
 		desc: prometheus.NewDesc(
 			"ebpf_service_syn_total",
 			"TCP SYN packets observed by eBPF for a Kubernetes service",
 			[]string{"namespace", "service"}, nil,
+		),
+		dropDesc: prometheus.NewDesc(
+			"kubewol_bpf_drop_total",
+			"BPF hot-path failures (e.g. map-full, ringbuf-full) grouped by reason",
+			[]string{"reason"}, nil,
 		),
 	}
 }
@@ -52,6 +66,7 @@ func NewExporter(provider Provider, remoteWriteURL string) *Exporter {
 // Describe implements prometheus.Collector.
 func (e *Exporter) Describe(ch chan<- *prometheus.Desc) {
 	ch <- e.desc
+	ch <- e.dropDesc
 }
 
 // Collect implements prometheus.Collector.
@@ -60,6 +75,18 @@ func (e *Exporter) Collect(ch chan<- prometheus.Metric) {
 		ch <- prometheus.MustNewConstMetric(
 			e.desc, prometheus.CounterValue, float64(m.Count),
 			m.Namespace, m.Service,
+		)
+	}
+	if e.dropProvider == nil {
+		return
+	}
+	drops, err := e.dropProvider()
+	if err != nil {
+		return
+	}
+	for reason, count := range drops {
+		ch <- prometheus.MustNewConstMetric(
+			e.dropDesc, prometheus.CounterValue, float64(count), reason,
 		)
 	}
 }

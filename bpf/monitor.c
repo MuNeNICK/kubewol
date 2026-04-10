@@ -147,6 +147,30 @@ struct {
     __uint(max_entries, 4096);
 } syn_events SEC(".maps");
 
+// BPF drop counters: per-reason per-CPU counters that userspace aggregates
+// and exposes as Prometheus metrics. Indices must stay in sync with
+// DropReason* in internal/ebpf/loader.go.
+//
+//   0 = syn_count update failed (map full or EINVAL)
+//   1 = ringbuf reserve failed  (ring full under SYN burst)
+//   2 = svc_key overflow (nodeport_to_svc had no room)
+#define DROP_SYN_COUNT_UPDATE 0
+#define DROP_RINGBUF_RESERVE  1
+#define DROP_REASON_MAX       3
+struct {
+    __uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
+    __uint(max_entries, DROP_REASON_MAX);
+    __type(key, __u32);
+    __type(value, __u64);
+} drop_count SEC(".maps");
+
+static __always_inline void drop_inc(__u32 reason)
+{
+    __u64 *c = bpf_map_lookup_elem(&drop_count, &reason);
+    if (c)
+        __sync_fetch_and_add(c, 1);
+}
+
 // ─────────────────────────────────────────
 // TC ingress: detect SYN, count, notify
 // ─────────────────────────────────────────
@@ -203,7 +227,8 @@ int traffic_monitor(struct __sk_buff *skb)
         __sync_fetch_and_add(cnt, 1);
     } else {
         __u64 init = 1;
-        bpf_map_update_elem(&syn_count, &count_key, &init, BPF_ANY);
+        if (bpf_map_update_elem(&syn_count, &count_key, &init, BPF_ANY) != 0)
+            drop_inc(DROP_SYN_COUNT_UPDATE);
     }
 
     // Check if scaled-to-zero (proxy_mode or nodeport_mode)
@@ -228,6 +253,8 @@ int traffic_monitor(struct __sk_buff *skb)
             evt->src_port = tcp->source;
             evt->dst_port = tcp->dest;
             bpf_ringbuf_submit(evt, 0);
+        } else {
+            drop_inc(DROP_RINGBUF_RESERVE);
         }
         // DROP the SYN: prevents conntrack entry, client TCP stack retransmits.
         // When pod becomes ready and proxy_mode turns OFF, the retransmit
@@ -271,8 +298,19 @@ int egress_rst_filter(struct __sk_buff *skb)
         if ((void *)(tcp + 1) > data_end)
             return TC_ACT_OK;
 
-        // Only RST packets (not RST+ACK from normal connection teardown with data)
+        // Only RST packets.
         if (!tcp->rst)
+            return TC_ACT_OK;
+
+        // Filter to RSTs that look like kube-proxy REJECT responses (no payload):
+        // ip_total_length - ip_hlen - tcp_hlen == 0. App-level resets that carry
+        // queued data still pass through, so legitimate backend reset signals
+        // are preserved during the suppression window.
+        __u32 tcp_hlen = tcp->doff * 4;
+        __u32 total_len = bpf_ntohs(ip->tot_len);
+        if (total_len < ip_hlen + tcp_hlen)
+            return TC_ACT_OK;
+        if (total_len - ip_hlen - tcp_hlen != 0)
             return TC_ACT_OK;
 
         // Check 1: src is ClusterIP:port
@@ -304,8 +342,9 @@ int egress_rst_filter(struct __sk_buff *skb)
         if (icmp->type != ICMP_TYPE_DEST_UNREACH || icmp->code != ICMP_CODE_PORT_UNREACH)
             return TC_ACT_OK;
 
-        // The ICMP payload contains the original IP header + 8 bytes
-        // Parse the embedded original packet to find the service
+        // The ICMP payload contains the original IP header + at least 8 bytes
+        // of the offending datagram (per RFC 792). Parse the embedded original
+        // packet to find the service.
         struct iphdr *orig_ip = (void *)(icmp + 1);
         if ((void *)(orig_ip + 1) > data_end)
             return TC_ACT_OK;
@@ -313,9 +352,17 @@ int egress_rst_filter(struct __sk_buff *skb)
         if (orig_ip->protocol != IPPROTO_TCP)
             return TC_ACT_OK;
 
-        // First 4 bytes after IP header = src_port(2) + dst_port(2)
-        __u16 *ports = (void *)orig_ip + (orig_ip->ihl * 4);
-        if ((void *)(ports + 2) > data_end)
+        // Validate the inner IP header length BEFORE indexing past it.
+        // ihl is in 32-bit words; minimum legal value is 5 (20 bytes).
+        // Without this check, a malformed ICMP payload could make the ports
+        // pointer land inside the inner IP header itself.
+        __u32 orig_ihl = orig_ip->ihl * 4;
+        if (orig_ihl < sizeof(struct iphdr))
+            return TC_ACT_OK;
+
+        // First 4 bytes after the inner IP header = src_port(2) + dst_port(2).
+        __u16 *ports = (void *)orig_ip + orig_ihl;
+        if ((void *)ports + 4 > data_end)
             return TC_ACT_OK;
 
         // Check ClusterIP match

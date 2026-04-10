@@ -10,8 +10,11 @@ package main
 import (
 	"context"
 	"flag"
+	"net"
 	"net/http"
 	"os"
+	"strings"
+	"time"
 
 	_ "k8s.io/client-go/plugin/pkg/client/auth"
 
@@ -41,22 +44,36 @@ func main() {
 	var probeAddr string
 	var metricsAddr string
 	var remoteWriteURL string
+	var ifaceAllow string
+	var ifaceDeny string
 
 	flag.StringVar(&probeAddr, "health-probe-bind-address", ":8081", "Health probe bind address.")
 	flag.StringVar(&metricsAddr, "metrics-bind-address", ":9090", "Prometheus /metrics bind address.")
 	flag.StringVar(&remoteWriteURL, "remote-write-url", "",
 		"Prometheus Remote Write URL (e.g. http://prometheus:9090/api/v1/write). "+
 			"When set, metrics are pushed immediately on SYN detection for fast cold start.")
+	flag.StringVar(&ifaceAllow, "tc-iface-allow", "",
+		"Comma-separated interface name prefixes to attach TC programs to. "+
+			"Empty means attach to every non-loopback interface. Use this on CNIs "+
+			"that bridge traffic through an intermediate interface (e.g. 'cni0,eth0') "+
+			"to avoid double-counting SYN packets.")
+	flag.StringVar(&ifaceDeny, "tc-iface-deny", "",
+		"Comma-separated interface name prefixes to EXCLUDE from TC attach. "+
+			"Evaluated after --tc-iface-allow.")
 
 	opts := zap.Options{Development: true}
 	opts.BindFlags(flag.CommandLine)
 	flag.Parse()
 	ctrl.SetLogger(zap.New(zap.UseFlagOptions(&opts)))
 
+	predicate := buildInterfacePredicate(ifaceAllow, ifaceDeny)
+
 	// eBPF
-	setupLog.Info("loading eBPF programs")
+	setupLog.Info("loading eBPF programs",
+		"ifaceAllow", ifaceAllow, "ifaceDeny", ifaceDeny)
 	bpfMgr, err := bpf.NewManager(bpf.Options{
-		Logger: ctrl.Log.WithName("ebpf"),
+		Logger:             ctrl.Log.WithName("ebpf"),
+		InterfacePredicate: predicate,
 	})
 	if err != nil {
 		setupLog.Error(err, "failed to init eBPF")
@@ -98,13 +115,23 @@ func main() {
 	}
 
 	// Prometheus exporter + Remote Write
-	exporter := metrics.NewExporter(reconciler.MetricsProvider(), remoteWriteURL)
+	exporter := metrics.NewExporter(
+		reconciler.MetricsProvider(),
+		bpfMgr.DropCounts,
+		remoteWriteURL,
+	)
 
-	// Prometheus /metrics HTTP server
+	// Prometheus /metrics HTTP server.
+	// SECURITY: this endpoint is unauthenticated. With hostNetwork: true the
+	// process binds 0.0.0.0:metricsAddr on the node, so anything on the node
+	// network can scrape it. Apply config/network-policy/allow-metrics-traffic.yaml
+	// (or an equivalent NetworkPolicy) to restrict access to your Prometheus
+	// namespace. See README "Securing the metrics endpoint" for details.
 	mux := http.NewServeMux()
 	mux.Handle("/metrics", exporter.Handler())
 	go func() {
-		setupLog.Info("Prometheus exporter listening", "addr", metricsAddr)
+		setupLog.Info("Prometheus exporter listening (UNAUTHENTICATED, restrict via NetworkPolicy)",
+			"addr", metricsAddr)
 		if err := http.ListenAndServe(metricsAddr, mux); err != nil {
 			setupLog.Error(err, "metrics server failed")
 		}
@@ -113,12 +140,62 @@ func main() {
 	// Ring buffer reader: log SYN events + trigger Remote Write push + direct scale
 	ctx := ctrl.SetupSignalHandler()
 	go readSynEvents(ctx, bpfMgr, exporter, reconciler)
+	// Dynamic TC attach: Pods created after startup get new veth pairs and need
+	// programs attached to them or RST suppression is skipped for their traffic.
+	go bpfMgr.WatchInterfaces(ctx, time.Second)
 
 	setupLog.Info("starting manager")
 	if err := mgr.Start(ctx); err != nil {
 		setupLog.Error(err, "problem running manager")
 		os.Exit(1)
 	}
+}
+
+// buildInterfacePredicate returns an interface filter for TC attach, honoring
+// the --tc-iface-allow and --tc-iface-deny prefix lists. Empty allow means
+// "match any non-loopback"; non-empty allow means "must have a matching prefix".
+// Deny is always applied after allow.
+func buildInterfacePredicate(allowCSV, denyCSV string) func(net.Interface) bool {
+	allow := splitPrefixes(allowCSV)
+	deny := splitPrefixes(denyCSV)
+	if len(allow) == 0 && len(deny) == 0 {
+		return nil
+	}
+	return func(iface net.Interface) bool {
+		name := iface.Name
+		if len(allow) > 0 {
+			matched := false
+			for _, p := range allow {
+				if strings.HasPrefix(name, p) {
+					matched = true
+					break
+				}
+			}
+			if !matched {
+				return false
+			}
+		}
+		for _, p := range deny {
+			if strings.HasPrefix(name, p) {
+				return false
+			}
+		}
+		return true
+	}
+}
+
+func splitPrefixes(csv string) []string {
+	if csv == "" {
+		return nil
+	}
+	parts := strings.Split(csv, ",")
+	out := parts[:0]
+	for _, p := range parts {
+		if s := strings.TrimSpace(p); s != "" {
+			out = append(out, s)
+		}
+	}
+	return out
 }
 
 // scaleJob is queued to the bounded worker pool when a SYN event hints
