@@ -2,69 +2,66 @@
 
 #include <linux/bpf.h>
 #include <linux/pkt_cls.h>
-#include <linux/if_ether.h>
-#include <linux/ip.h>
-#include <linux/tcp.h>
-#include <linux/in.h>
 #include <bpf/bpf_helpers.h>
 #include <bpf/bpf_endian.h>
 
-// Minimal ICMP header (avoid pulling in linux/icmp.h which has glibc dep issues)
-struct icmphdr_min {
-    __u8  type;
-    __u8  code;
-    __u16 checksum;
-    __u32 un;
-};
-
-// ICMP destination unreachable codes we care about.
-// ICMP_DEST_UNREACH (type 3) is broad; we only suppress code 3 (port unreachable),
-// which is what kube-proxy emits. Other codes such as fragmentation-needed (code 4)
-// carry real network signals and must not be dropped.
-#define ICMP_TYPE_DEST_UNREACH 3
-#define ICMP_CODE_PORT_UNREACH 3
-
-// 802.1Q / 802.1AD VLAN tag control information (TCI + next ethertype).
-struct vlan_hdr {
-    __u16 tci;
-    __u16 ethertype;
-};
-
+// Hermetic header constants. Previously this file pulled in linux/if_ether.h,
+// linux/ip.h, linux/tcp.h and linux/in.h and walked the packet via direct
+// data/data_end pointer arithmetic. That form requires CAP_PERFMON because
+// the BPF verifier classifies dynamic pointer arithmetic as privileged and
+// rejects it under the unprivileged policy with
+//   "R1 has pointer with unsupported alu operation,
+//    pointer arithmetic with it prohibited for !root"
+//
+// Every packet field is now read via bpf_skb_load_bytes() with a scalar byte
+// offset. Scalars are bounded (ihl is masked and shifted, so <=60) so the
+// verifier can prove the sums stay in range. The resulting programs load
+// under kernel 6.6+ with only CAP_BPF + CAP_NET_ADMIN.
+#ifndef ETH_P_IP
+#define ETH_P_IP 0x0800
+#endif
 #ifndef ETH_P_8021Q
-#define ETH_P_8021Q  0x8100
+#define ETH_P_8021Q 0x8100
 #endif
 #ifndef ETH_P_8021AD
 #define ETH_P_8021AD 0x88A8
 #endif
 
-// parse_l3 skips the Ethernet header and up to two VLAN tags and returns the
-// offset of the IPv4 header. Returns 0 if the packet is not IPv4 or is malformed.
-static __always_inline __u32 parse_l3(void *data, void *data_end)
-{
-    struct ethhdr *eth = data;
-    if ((void *)(eth + 1) > data_end)
-        return 0;
-    __u16 proto = eth->h_proto;
-    __u32 off = sizeof(*eth);
+#define IPPROTO_TCP  6
+#define IPPROTO_ICMP 1
 
-    // Unwind up to two stacked VLAN tags (802.1Q / 802.1AD).
-    #pragma unroll
-    for (int i = 0; i < 2; i++) {
-        if (proto != bpf_htons(ETH_P_8021Q) && proto != bpf_htons(ETH_P_8021AD))
-            break;
-        struct vlan_hdr *vh = data + off;
-        if ((void *)(vh + 1) > data_end)
-            return 0;
-        proto = vh->ethertype;
-        off += sizeof(*vh);
-    }
+// TCP flag bits in the 13th byte of the TCP header.
+#define TCP_FLAG_SYN 0x02
+#define TCP_FLAG_RST 0x04
+#define TCP_FLAG_ACK 0x10
 
-    if (proto != bpf_htons(ETH_P_IP))
-        return 0;
-    if (data + off + sizeof(struct iphdr) > data_end)
-        return 0;
-    return off;
-}
+// ICMP destination unreachable: only suppress code 3 (port unreachable),
+// which is what kube-proxy REJECT emits. Other codes (e.g. 4 fragmentation
+// needed) carry real network signals and must never be dropped.
+#define ICMP_TYPE_DEST_UNREACH 3
+#define ICMP_CODE_PORT_UNREACH 3
+
+// Static offsets used with bpf_skb_load_bytes.
+#define ETH_HLEN          14
+#define ETH_P_OFF         12 /* ethertype field inside Ethernet header */
+#define VLAN_HLEN         4
+#define VLAN_NEXT_P_OFF   2  /* next ethertype inside a VLAN tag */
+
+#define IP_TOTLEN_OFF     2
+#define IP_PROTO_OFF      9
+#define IP_SADDR_OFF      12
+#define IP_DADDR_OFF      16
+#define IP_MIN_HLEN       20
+
+#define TCP_SPORT_OFF     0
+#define TCP_DPORT_OFF     2
+#define TCP_DOFF_OFF      12 /* high nibble = data offset in 32-bit words */
+#define TCP_FLAGS_OFF     13
+#define TCP_MIN_HLEN      20
+
+#define ICMP_TYPE_OFF     0
+#define ICMP_CODE_OFF     1
+#define ICMP_INNER_OFF    8  /* inner IP starts at ICMP + 8 (RFC 792) */
 
 // Key: Service ClusterIP + port
 struct svc_key {
@@ -147,13 +144,9 @@ struct {
     __uint(max_entries, 4096);
 } syn_events SEC(".maps");
 
-// BPF drop counters: per-reason per-CPU counters that userspace aggregates
-// and exposes as Prometheus metrics. Indices must stay in sync with
+// BPF drop counters: per-reason PERCPU_ARRAY that userspace aggregates and
+// exposes as kubewol_bpf_drop_total{reason}. Keep indices in sync with
 // DropReason* in internal/ebpf/loader.go.
-//
-//   0 = syn_count update failed (map full or EINVAL)
-//   1 = ringbuf reserve failed  (ring full under SYN burst)
-//   2 = svc_key overflow (nodeport_to_svc had no room)
 #define DROP_SYN_COUNT_UPDATE 0
 #define DROP_RINGBUF_RESERVE  1
 #define DROP_REASON_MAX       3
@@ -171,40 +164,102 @@ static __always_inline void drop_inc(__u32 reason)
         __sync_fetch_and_add(c, 1);
 }
 
+// parse_l3_off returns the L3 byte offset inside the skb, skipping Ethernet
+// and up to two stacked VLAN tags. Returns 1 on success, 0 if the packet is
+// not IPv4 or the headers cannot be read. Uses bpf_skb_load_bytes exclusively
+// so the verifier never sees pointer arithmetic on data pointers.
+static __always_inline int parse_l3_off(struct __sk_buff *skb, __u32 *l3_off_out)
+{
+    __u16 h_proto = 0;
+    __u32 off = ETH_HLEN;
+
+    if (bpf_skb_load_bytes(skb, ETH_P_OFF, &h_proto, sizeof(h_proto)) < 0)
+        return 0;
+
+    if (h_proto == bpf_htons(ETH_P_8021Q) || h_proto == bpf_htons(ETH_P_8021AD)) {
+        if (bpf_skb_load_bytes(skb, off + VLAN_NEXT_P_OFF, &h_proto, sizeof(h_proto)) < 0)
+            return 0;
+        off += VLAN_HLEN;
+        if (h_proto == bpf_htons(ETH_P_8021Q) || h_proto == bpf_htons(ETH_P_8021AD)) {
+            if (bpf_skb_load_bytes(skb, off + VLAN_NEXT_P_OFF, &h_proto, sizeof(h_proto)) < 0)
+                return 0;
+            off += VLAN_HLEN;
+        }
+    }
+
+    if (h_proto != bpf_htons(ETH_P_IP))
+        return 0;
+
+    *l3_off_out = off;
+    return 1;
+}
+
+// read_ip_header loads version/ihl, protocol and both addresses at l3_off.
+// Returns 1 on success, 0 on load failure or malformed IPv4 header.
+static __always_inline int read_ip_header(
+    struct __sk_buff *skb, __u32 l3_off,
+    __u32 *ihl_out, __u8 *proto_out, __u32 *saddr_out, __u32 *daddr_out)
+{
+    __u8 vihl;
+    if (bpf_skb_load_bytes(skb, l3_off, &vihl, sizeof(vihl)) < 0)
+        return 0;
+    if ((vihl >> 4) != 4)
+        return 0;
+    __u32 ihl = ((__u32)(vihl & 0x0F)) << 2;
+    if (ihl < IP_MIN_HLEN)
+        return 0;
+
+    __u8 proto;
+    if (bpf_skb_load_bytes(skb, l3_off + IP_PROTO_OFF, &proto, sizeof(proto)) < 0)
+        return 0;
+    __u32 saddr = 0, daddr = 0;
+    if (bpf_skb_load_bytes(skb, l3_off + IP_SADDR_OFF, &saddr, sizeof(saddr)) < 0)
+        return 0;
+    if (bpf_skb_load_bytes(skb, l3_off + IP_DADDR_OFF, &daddr, sizeof(daddr)) < 0)
+        return 0;
+
+    *ihl_out = ihl;
+    *proto_out = proto;
+    *saddr_out = saddr;
+    *daddr_out = daddr;
+    return 1;
+}
+
 // ─────────────────────────────────────────
 // TC ingress: detect SYN, count, notify
 // ─────────────────────────────────────────
 SEC("tc")
 int traffic_monitor(struct __sk_buff *skb)
 {
-    void *data     = (void *)(long)skb->data;
-    void *data_end = (void *)(long)skb->data_end;
-
-    __u32 l3_off = parse_l3(data, data_end);
-    if (l3_off == 0)
+    __u32 l3_off;
+    if (!parse_l3_off(skb, &l3_off))
         return TC_ACT_OK;
 
-    struct iphdr *ip = data + l3_off;
-    if ((void *)(ip + 1) > data_end)
+    __u32 ihl;
+    __u8 proto;
+    __u32 saddr, daddr;
+    if (!read_ip_header(skb, l3_off, &ihl, &proto, &saddr, &daddr))
         return TC_ACT_OK;
-    if (ip->protocol != IPPROTO_TCP)
-        return TC_ACT_OK;
-
-    __u32 ip_hlen = ip->ihl * 4;
-    if (ip_hlen < sizeof(struct iphdr))
+    if (proto != IPPROTO_TCP)
         return TC_ACT_OK;
 
-    struct tcphdr *tcp = (void *)ip + ip_hlen;
-    if ((void *)(tcp + 1) > data_end)
+    __u32 l4_off = l3_off + ihl;
+    __u16 sport = 0, dport = 0;
+    __u8 flags = 0;
+    if (bpf_skb_load_bytes(skb, l4_off + TCP_SPORT_OFF, &sport, sizeof(sport)) < 0)
+        return TC_ACT_OK;
+    if (bpf_skb_load_bytes(skb, l4_off + TCP_DPORT_OFF, &dport, sizeof(dport)) < 0)
+        return TC_ACT_OK;
+    if (bpf_skb_load_bytes(skb, l4_off + TCP_FLAGS_OFF, &flags, sizeof(flags)) < 0)
         return TC_ACT_OK;
 
     // Only pure SYN (new connection attempt)
-    if (!(tcp->syn) || tcp->ack)
+    if (!(flags & TCP_FLAG_SYN) || (flags & TCP_FLAG_ACK))
         return TC_ACT_OK;
 
     struct svc_key key = {
-        .addr = ip->daddr,
-        .port = tcp->dest,
+        .addr = daddr,
+        .port = dport,
         .pad  = 0,
     };
 
@@ -214,8 +269,8 @@ int traffic_monitor(struct __sk_buff *skb)
     // Fallback: NodePort -> resolve to ClusterIP key
     struct svc_key count_key = key;
     if (!watched) {
-        __u32 dport = tcp->dest;
-        struct svc_key *resolved = bpf_map_lookup_elem(&nodeport_to_svc, &dport);
+        __u32 dport_pad = dport;
+        struct svc_key *resolved = bpf_map_lookup_elem(&nodeport_to_svc, &dport_pad);
         if (!resolved)
             return TC_ACT_OK;
         count_key = *resolved;
@@ -237,9 +292,9 @@ int traffic_monitor(struct __sk_buff *skb)
     if (pmode && *pmode) {
         scaled_to_zero = 1;
     } else {
-        __u32 dport3 = tcp->dest;
-        __u8 *nmode3 = bpf_map_lookup_elem(&nodeport_mode, &dport3);
-        if (nmode3 && *nmode3)
+        __u32 dport_pad = dport;
+        __u8 *nmode = bpf_map_lookup_elem(&nodeport_mode, &dport_pad);
+        if (nmode && *nmode)
             scaled_to_zero = 1;
     }
 
@@ -248,10 +303,10 @@ int traffic_monitor(struct __sk_buff *skb)
         struct syn_event *evt;
         evt = bpf_ringbuf_reserve(&syn_events, sizeof(*evt), 0);
         if (evt) {
-            evt->src_addr = ip->saddr;
-            evt->dst_addr = ip->daddr;
-            evt->src_port = tcp->source;
-            evt->dst_port = tcp->dest;
+            evt->src_addr = saddr;
+            evt->dst_addr = daddr;
+            evt->src_port = sport;
+            evt->dst_port = dport;
             bpf_ringbuf_submit(evt, 0);
         } else {
             drop_inc(DROP_RINGBUF_RESERVE);
@@ -278,45 +333,54 @@ int traffic_monitor(struct __sk_buff *skb)
 SEC("tc")
 int egress_rst_filter(struct __sk_buff *skb)
 {
-    void *data     = (void *)(long)skb->data;
-    void *data_end = (void *)(long)skb->data_end;
-
-    __u32 l3_off = parse_l3(data, data_end);
-    if (l3_off == 0)
+    __u32 l3_off;
+    if (!parse_l3_off(skb, &l3_off))
         return TC_ACT_OK;
 
-    struct iphdr *ip = data + l3_off;
-    if ((void *)(ip + 1) > data_end)
+    __u32 ihl;
+    __u8 proto;
+    __u32 saddr, daddr;
+    if (!read_ip_header(skb, l3_off, &ihl, &proto, &saddr, &daddr))
         return TC_ACT_OK;
 
-    __u32 ip_hlen = ip->ihl * 4;
-    if (ip_hlen < sizeof(struct iphdr))
+    __u16 tot_len_be;
+    if (bpf_skb_load_bytes(skb, l3_off + IP_TOTLEN_OFF, &tot_len_be, sizeof(tot_len_be)) < 0)
         return TC_ACT_OK;
+    __u32 tot_len = bpf_ntohs(tot_len_be);
 
-    if (ip->protocol == IPPROTO_TCP) {
-        struct tcphdr *tcp = (void *)ip + ip_hlen;
-        if ((void *)(tcp + 1) > data_end)
+    __u32 l4_off = l3_off + ihl;
+
+    if (proto == IPPROTO_TCP) {
+        __u8 flags;
+        if (bpf_skb_load_bytes(skb, l4_off + TCP_FLAGS_OFF, &flags, sizeof(flags)) < 0)
+            return TC_ACT_OK;
+        if (!(flags & TCP_FLAG_RST))
             return TC_ACT_OK;
 
-        // Only RST packets.
-        if (!tcp->rst)
+        __u8 doff_byte;
+        if (bpf_skb_load_bytes(skb, l4_off + TCP_DOFF_OFF, &doff_byte, sizeof(doff_byte)) < 0)
+            return TC_ACT_OK;
+        __u32 tcp_hlen = ((__u32)((doff_byte >> 4) & 0x0F)) << 2;
+        if (tcp_hlen < TCP_MIN_HLEN)
             return TC_ACT_OK;
 
         // Filter to RSTs that look like kube-proxy REJECT responses (no payload):
         // ip_total_length - ip_hlen - tcp_hlen == 0. App-level resets that carry
         // queued data still pass through, so legitimate backend reset signals
         // are preserved during the suppression window.
-        __u32 tcp_hlen = tcp->doff * 4;
-        __u32 total_len = bpf_ntohs(ip->tot_len);
-        if (total_len < ip_hlen + tcp_hlen)
+        if (tot_len < ihl + tcp_hlen)
             return TC_ACT_OK;
-        if (total_len - ip_hlen - tcp_hlen != 0)
+        if (tot_len - ihl - tcp_hlen != 0)
+            return TC_ACT_OK;
+
+        __u16 sport;
+        if (bpf_skb_load_bytes(skb, l4_off + TCP_SPORT_OFF, &sport, sizeof(sport)) < 0)
             return TC_ACT_OK;
 
         // Check 1: src is ClusterIP:port
         struct svc_key key = {
-            .addr = ip->saddr,
-            .port = tcp->source,
+            .addr = saddr,
+            .port = sport,
             .pad  = 0,
         };
         __u8 *rs = bpf_map_lookup_elem(&rst_suppress, &key);
@@ -325,50 +389,52 @@ int egress_rst_filter(struct __sk_buff *skb)
         }
 
         // Check 2: src port is a NodePort (reverse-NATed RST)
-        __u32 sport = tcp->source;
-        __u8 *nrs = bpf_map_lookup_elem(&nodeport_rst_suppress, &sport);
+        __u32 sport_pad = sport;
+        __u8 *nrs = bpf_map_lookup_elem(&nodeport_rst_suppress, &sport_pad);
         if (nrs && *nrs) {
             return TC_ACT_SHOT;
         }
-    } else if (ip->protocol == IPPROTO_ICMP) {
-        // ICMP destination unreachable might also be sent by kube-proxy REJECT.
-        struct icmphdr_min *icmp = (void *)ip + ip_hlen;
-        if ((void *)(icmp + 1) > data_end)
+    } else if (proto == IPPROTO_ICMP) {
+        __u8 icmp_type, icmp_code;
+        if (bpf_skb_load_bytes(skb, l4_off + ICMP_TYPE_OFF, &icmp_type, sizeof(icmp_type)) < 0)
             return TC_ACT_OK;
-
-        // Only suppress type 3 code 3 (port unreachable). Other codes, especially
-        // code 4 (fragmentation needed), carry real network signals and must not
-        // be dropped or Path MTU discovery breaks.
-        if (icmp->type != ICMP_TYPE_DEST_UNREACH || icmp->code != ICMP_CODE_PORT_UNREACH)
+        if (bpf_skb_load_bytes(skb, l4_off + ICMP_CODE_OFF, &icmp_code, sizeof(icmp_code)) < 0)
+            return TC_ACT_OK;
+        if (icmp_type != ICMP_TYPE_DEST_UNREACH || icmp_code != ICMP_CODE_PORT_UNREACH)
             return TC_ACT_OK;
 
         // The ICMP payload contains the original IP header + at least 8 bytes
         // of the offending datagram (per RFC 792). Parse the embedded original
         // packet to find the service.
-        struct iphdr *orig_ip = (void *)(icmp + 1);
-        if ((void *)(orig_ip + 1) > data_end)
+        __u32 inner_off = l4_off + ICMP_INNER_OFF;
+
+        __u8 inner_vihl;
+        if (bpf_skb_load_bytes(skb, inner_off, &inner_vihl, sizeof(inner_vihl)) < 0)
+            return TC_ACT_OK;
+        if ((inner_vihl >> 4) != 4)
+            return TC_ACT_OK;
+        __u32 inner_ihl = ((__u32)(inner_vihl & 0x0F)) << 2;
+        if (inner_ihl < IP_MIN_HLEN)
             return TC_ACT_OK;
 
-        if (orig_ip->protocol != IPPROTO_TCP)
+        __u8 inner_proto;
+        if (bpf_skb_load_bytes(skb, inner_off + IP_PROTO_OFF, &inner_proto, sizeof(inner_proto)) < 0)
+            return TC_ACT_OK;
+        if (inner_proto != IPPROTO_TCP)
             return TC_ACT_OK;
 
-        // Validate the inner IP header length BEFORE indexing past it.
-        // ihl is in 32-bit words; minimum legal value is 5 (20 bytes).
-        // Without this check, a malformed ICMP payload could make the ports
-        // pointer land inside the inner IP header itself.
-        __u32 orig_ihl = orig_ip->ihl * 4;
-        if (orig_ihl < sizeof(struct iphdr))
+        __u32 inner_daddr = 0;
+        if (bpf_skb_load_bytes(skb, inner_off + IP_DADDR_OFF, &inner_daddr, sizeof(inner_daddr)) < 0)
             return TC_ACT_OK;
 
-        // First 4 bytes after the inner IP header = src_port(2) + dst_port(2).
-        __u16 *ports = (void *)orig_ip + orig_ihl;
-        if ((void *)ports + 4 > data_end)
+        __u16 inner_dport = 0;
+        if (bpf_skb_load_bytes(skb, inner_off + inner_ihl + TCP_DPORT_OFF, &inner_dport, sizeof(inner_dport)) < 0)
             return TC_ACT_OK;
 
         // Check ClusterIP match
         struct svc_key key = {
-            .addr = orig_ip->daddr,
-            .port = ports[1],
+            .addr = inner_daddr,
+            .port = inner_dport,
             .pad  = 0,
         };
         __u8 *rs = bpf_map_lookup_elem(&rst_suppress, &key);
@@ -376,8 +442,8 @@ int egress_rst_filter(struct __sk_buff *skb)
             return TC_ACT_SHOT;
         }
         // Check NodePort match
-        __u32 dport = ports[1];
-        __u8 *nrs = bpf_map_lookup_elem(&nodeport_rst_suppress, &dport);
+        __u32 dport_pad = inner_dport;
+        __u8 *nrs = bpf_map_lookup_elem(&nodeport_rst_suppress, &dport_pad);
         if (nrs && *nrs) {
             return TC_ACT_SHOT;
         }

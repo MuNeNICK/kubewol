@@ -67,16 +67,17 @@ spec:
           #
           # - CAP_BPF: load eBPF programs, create/update BPF maps
           # - CAP_NET_ADMIN: attach TC (tcx) hooks to network interfaces
-          # - CAP_PERFMON: required by the BPF verifier to allow pointer
-          #   arithmetic on packet data (parse_l3 skips the Ethernet + VLAN
-          #   headers, egress_rst_filter walks inner IP payload). Without it
-          #   the verifier rejects programs with "pointer arithmetic with it
-          #   prohibited for !root". Not related to perf_event_open.
+          #
+          # CAP_PERFMON used to be required because bpf/monitor.c walked
+          # packet data with direct pointer arithmetic, which the verifier
+          # classifies as privileged. The programs now read every packet
+          # field with bpf_skb_load_bytes() and scalar offsets, so CAP_BPF
+          # + CAP_NET_ADMIN is enough.
           #
           # CAP_SYS_RESOURCE was previously added to raise RLIMIT_MEMLOCK on
           # kernels <5.11. This project targets kernel 6.6+ (TCX), where BPF
-          # memory accounting is cgroup-based and CAP_BPF already bypasses the
-          # memlock rlimit, so the capability is no longer required.
+          # memory accounting is cgroup-based and CAP_BPF already bypasses
+          # the memlock rlimit, so the capability is no longer required.
           securityContext:
             privileged: false
             allowPrivilegeEscalation: false
@@ -94,7 +95,6 @@ spec:
               add:
                 - BPF
                 - NET_ADMIN
-                - PERFMON
           livenessProbe:
             httpGet:
               path: /healthz

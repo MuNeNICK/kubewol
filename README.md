@@ -25,6 +25,8 @@ Pod Ready:
 - Linux kernel **6.6+** (for TCX BPF link support)
 - **Prometheus** + **Prometheus Adapter** (for HPA external metrics)
 
+The DaemonSet runs as UID `65532` with only `CAP_BPF` and `CAP_NET_ADMIN`; no root, no `SYS_ADMIN`, no `PERFMON`. File capabilities are set on the `/manager` binary at build time so the non-root exec keeps the caps.
+
 ## Install
 
 ```bash

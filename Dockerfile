@@ -17,7 +17,7 @@ COPY --from=builder /workspace/manager /manager
 # UID (runAsUser: 65532). Without file caps, a non-root exec clears the
 # effective set even if SecurityContext.capabilities.add lists them, and
 # bpf(BPF_PROG_LOAD) returns EPERM.
-RUN setcap cap_bpf,cap_net_admin,cap_perfmon=eip /manager
+RUN setcap cap_bpf,cap_net_admin=eip /manager
 # Run as the nonroot UID provided by distroless / nobody in alpine.
 USER 65532:65532
 ENTRYPOINT ["/manager"]
