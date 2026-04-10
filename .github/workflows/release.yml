@@ -23,13 +23,22 @@ jobs:
         with:
           go-version-file: go.mod
 
-      - name: Install clang
-        run: sudo apt-get update && sudo apt-get install -y clang llvm libbpf-dev
+      - name: Install clang and kernel headers
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y clang llvm libbpf-dev linux-headers-generic gcc-multilib
 
       - name: Compile eBPF
         run: |
+          ARCH=$(uname -m)
+          case "$ARCH" in
+            x86_64) ASM_INCLUDE="/usr/include/x86_64-linux-gnu" ;;
+            aarch64) ASM_INCLUDE="/usr/include/aarch64-linux-gnu" ;;
+            *) ASM_INCLUDE="/usr/include/$ARCH-linux-gnu" ;;
+          esac
           clang -O2 -g -target bpf -D__TARGET_ARCH_x86 \
             -I/usr/include \
+            -I"$ASM_INCLUDE" \
             -c bpf/monitor.c \
             -o internal/ebpf/monitor.o
 
