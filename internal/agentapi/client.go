@@ -1,64 +1,63 @@
+// Package agentapi is the bridge between the kubewol controller Deployment
+// and the kubewol agent DaemonSet. The wire format is gRPC (defined in
+// proto/kubewol/v1/agent.proto); this file hosts the controller-side helper
+// that opens a connection to one agent Pod and refreshes its audience-bound
+// bearer token per RPC.
+//
+// Authentication model:
+//   - Transport: TLS with InsecureSkipVerify. The agent presents a
+//     self-signed certificate generated in-memory at startup; verifying it
+//     would require cert-manager or an equivalent CA bootstrap that kubewol
+//     deliberately avoids. Residual MITM risk is mitigated by:
+//       1. pod-network scoping via NetworkPolicy,
+//       2. the audience-bound bearer token below.
+//   - Bearer token: a projected ServiceAccount token with
+//     audience=kubewol.io/agent-api. The agent's gRPC auth interceptor
+//     validates it via TokenReview with spec.audiences set, so a leaked
+//     token cannot be replayed against kube-apiserver or any other
+//     audience-unchecked in-cluster service.
 package agentapi
 
 import (
-	"bufio"
-	"bytes"
 	"context"
 	"crypto/tls"
-	"encoding/json"
 	"fmt"
-	"io"
-	"net/http"
 	"os"
 	"strings"
 	"sync"
-	"sync/atomic"
 	"time"
+
+	"google.golang.org/grpc"
+	"google.golang.org/grpc/credentials"
+	"google.golang.org/grpc/metadata"
+
+	pb "github.com/munenick/kubewol/internal/agentapi/pb"
 )
 
 // DefaultAudienceTokenPath is the projected volume path for the audience-bound
-// ServiceAccount token. The controller Deployment mounts a projected token
-// with audience kubewol.io/agent-api there so that a leaked bearer can only
-// be replayed against kubewol agents, not against kube-apiserver or any
-// other audience-unchecked Kubernetes component.
+// ServiceAccount token.
 const DefaultAudienceTokenPath = "/var/run/secrets/kubewol/agent-api/token"
 
-// FallbackTokenPath is the default ServiceAccount volume path. Used when the
-// audience-bound volume is not mounted (e.g. older manifests / unit tests).
+// FallbackTokenPath is the default ServiceAccount volume path. Used for
+// graceful degradation and unit tests.
 const FallbackTokenPath = "/var/run/secrets/kubernetes.io/serviceaccount/token"
 
-// sseIdleTimeout is how long StreamSynEvents will tolerate no bytes from the
-// agent before closing the connection and surfacing an error. The agent emits
-// ":ka\n\n" SSE comments every 20 seconds, so 60 seconds gives a 3x margin
-// before the client decides the connection is dead.
-const sseIdleTimeout = 60 * time.Second
-
-// Client talks to one agent HTTP endpoint on behalf of the controller.
-// One Client per agent pod IP. The controller creates / discards Clients as
-// EndpointSlice changes.
+// Client wraps a grpc.ClientConn and the audience-bound token file, handing
+// back a pb.AgentClient that automatically attaches the bearer token to
+// every outgoing RPC. One Client per agent pod IP; the controller Fleet
+// creates and discards them as EndpointSlice changes.
 type Client struct {
-	base      string // https://<pod-ip>:<port>
-	tokenPath string // projected volume path; re-read on every request
-	hc        *http.Client
+	conn      *grpc.ClientConn
+	pb        pb.AgentClient
+	tokenPath string
+
+	mu    sync.Mutex
+	token string
 }
 
-// NewClient builds a Client for the given base URL (scheme://host:port).
-// tokenPath should point at a projected ServiceAccount token; if empty the
-// audience-bound path at DefaultAudienceTokenPath is tried first, then the
-// legacy SA path is used as a fallback.
-//
-// TLS: InsecureSkipVerify is set because the agent presents a self-signed
-// certificate generated in-memory by the controller-runtime metrics server.
-// Verifying it would require cert-manager or an equivalent CA bootstrap.
-// The residual MITM risk is mitigated by two defenses:
-//   - Network path: agents and controllers only talk over the pod network;
-//     NetworkPolicy scopes access to the kubewol-system controller pod.
-//   - Token scope: the bearer presented here is an audience-bound projected
-//     SA token (audience: kubewol.io/agent-api). Even if intercepted, the
-//     kube-apiserver TokenReview on the agent side refuses any token whose
-//     audience does not match, so the leaked credential cannot be replayed
-//     against kube-apiserver or any other audience-unchecked service.
-func NewClient(base, tokenPath string) (*Client, error) {
+// NewClient dials the given target (host:port) and returns a Client. The
+// target is passed to grpc.NewClient directly; scheme is implicit.
+func NewClient(target, tokenPath string) (*Client, error) {
 	if tokenPath == "" {
 		if _, err := os.Stat(DefaultAudienceTokenPath); err == nil {
 			tokenPath = DefaultAudienceTokenPath
@@ -70,149 +69,85 @@ func NewClient(base, tokenPath string) (*Client, error) {
 	if _, err := os.ReadFile(tokenPath); err != nil {
 		return nil, fmt.Errorf("read SA token %s: %w", tokenPath, err)
 	}
+
+	tlsCfg := &tls.Config{
+		InsecureSkipVerify: true, // self-signed agent cert; see package doc.
+		MinVersion:         tls.VersionTLS12,
+	}
+	conn, err := grpc.NewClient(target,
+		grpc.WithTransportCredentials(credentials.NewTLS(tlsCfg)),
+		grpc.WithDefaultCallOptions(
+			grpc.MaxCallRecvMsgSize(4*1024*1024),
+			grpc.MaxCallSendMsgSize(4*1024*1024),
+		),
+	)
+	if err != nil {
+		return nil, fmt.Errorf("grpc dial %s: %w", target, err)
+	}
 	return &Client{
-		base:      strings.TrimRight(base, "/"),
+		conn:      conn,
+		pb:        pb.NewAgentClient(conn),
 		tokenPath: tokenPath,
-		hc: &http.Client{
-			Timeout: 10 * time.Second,
-			Transport: &http.Transport{
-				TLSClientConfig: &tls.Config{InsecureSkipVerify: true},
-			},
-		},
 	}, nil
 }
 
-// currentToken re-reads the projected SA token file. Projected tokens are
-// rotated by kubelet well before expiry, so the in-memory value becomes
-// stale if cached once at startup.
+// Close shuts down the underlying grpc.ClientConn.
+func (c *Client) Close() error {
+	if c.conn == nil {
+		return nil
+	}
+	return c.conn.Close()
+}
+
+// withToken attaches a fresh Bearer token to the outgoing context. Projected
+// ServiceAccount tokens are rotated by kubelet well before expiry, so the
+// in-memory token becomes stale if cached for the full process lifetime.
+func (c *Client) withToken(ctx context.Context) (context.Context, error) {
+	tok, err := c.currentToken()
+	if err != nil {
+		return nil, err
+	}
+	return metadata.AppendToOutgoingContext(ctx, "authorization", "Bearer "+tok), nil
+}
+
 func (c *Client) currentToken() (string, error) {
 	b, err := os.ReadFile(c.tokenPath)
 	if err != nil {
-		return "", err
+		return "", fmt.Errorf("read SA token: %w", err)
 	}
 	return strings.TrimSpace(string(b)), nil
 }
 
-// PutWatches replaces the agent's full desired state.
-func (c *Client) PutWatches(ctx context.Context, spec WatchSpec) error {
-	body, err := json.Marshal(spec)
-	if err != nil {
-		return fmt.Errorf("marshal watches: %w", err)
-	}
-	req, err := http.NewRequestWithContext(ctx, http.MethodPut, c.base+PathWatches, bytes.NewReader(body))
-	if err != nil {
-		return err
-	}
-	token, err := c.currentToken()
-	if err != nil {
-		return fmt.Errorf("read SA token: %w", err)
-	}
-	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("Authorization", "Bearer "+token)
-
-	resp, err := c.hc.Do(req)
-	if err != nil {
-		return fmt.Errorf("PUT %s: %w", PathWatches, err)
-	}
-	defer func() { _ = resp.Body.Close() }()
-	if resp.StatusCode/100 != 2 {
-		b, _ := io.ReadAll(io.LimitReader(resp.Body, 512))
-		return fmt.Errorf("PUT %s: status %d: %s", PathWatches, resp.StatusCode, strings.TrimSpace(string(b)))
-	}
-	_, _ = io.Copy(io.Discard, resp.Body)
-	return nil
-}
-
-// StreamSynEvents opens a long-lived SSE connection and calls onEvent for
-// every SynEventMsg the agent emits until the context is cancelled or the
-// connection drops. It returns whatever error ended the stream.
-//
-// Idle watchdog: the agent writes a ":ka\n\n" SSE comment every 20 seconds.
-// If the client sees no bytes at all for sseIdleTimeout (60s) it concludes
-// the connection is half-dead (TCP RST eaten by an intermediate path, or
-// the agent blocked in kernel), cancels the request context, and returns.
-// The caller is expected to wrap this in a retry loop.
-func (c *Client) StreamSynEvents(ctx context.Context, onEvent func(SynEventMsg)) error {
-	ctx, cancel := context.WithCancel(ctx)
+// PutWatches replaces the agent's full desired state in one RPC.
+func (c *Client) PutWatches(ctx context.Context, spec *pb.WatchSpec) error {
+	ctx, cancel := context.WithTimeout(ctx, 10*time.Second)
 	defer cancel()
 
-	// Separate HTTP client: no total timeout, because SSE is long-lived.
-	streamer := &http.Client{
-		Transport: &http.Transport{
-			TLSClientConfig:       &tls.Config{InsecureSkipVerify: true},
-			ResponseHeaderTimeout: 10 * time.Second,
-		},
-	}
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, c.base+PathSynEvents, nil)
+	ctx, err := c.withToken(ctx)
 	if err != nil {
 		return err
 	}
-	token, err := c.currentToken()
+	_, err = c.pb.PutWatches(ctx, spec)
+	return err
+}
+
+// StreamSynEvents opens a server-side stream and calls onEvent for every
+// direct-scale-eligible SynEvent until the stream disconnects. Caller is
+// expected to wrap this in a retry loop with backoff.
+func (c *Client) StreamSynEvents(ctx context.Context, onEvent func(*pb.SynEvent)) error {
+	ctx, err := c.withToken(ctx)
 	if err != nil {
-		return fmt.Errorf("read SA token: %w", err)
+		return err
 	}
-	req.Header.Set("Accept", "text/event-stream")
-	req.Header.Set("Authorization", "Bearer "+token)
-
-	resp, err := streamer.Do(req)
+	stream, err := c.pb.SubscribeSynEvents(ctx, &pb.SubscribeRequest{})
 	if err != nil {
-		return fmt.Errorf("GET %s: %w", PathSynEvents, err)
+		return fmt.Errorf("SubscribeSynEvents: %w", err)
 	}
-	defer func() { _ = resp.Body.Close() }()
-	if resp.StatusCode != http.StatusOK {
-		b, _ := io.ReadAll(io.LimitReader(resp.Body, 512))
-		return fmt.Errorf("GET %s: status %d: %s", PathSynEvents, resp.StatusCode, strings.TrimSpace(string(b)))
-	}
-
-	// lastRead is monotonic-ish: nanoseconds since program start at the time
-	// the scanner last returned a line. Updated on every read, checked by a
-	// ticker goroutine that cancels the context on idle timeout.
-	var lastRead int64
-	atomic.StoreInt64(&lastRead, time.Now().UnixNano())
-	var idleStop sync.WaitGroup
-	idleStop.Add(1)
-	go func() {
-		defer idleStop.Done()
-		ticker := time.NewTicker(10 * time.Second)
-		defer ticker.Stop()
-		for {
-			select {
-			case <-ctx.Done():
-				return
-			case now := <-ticker.C:
-				last := time.Unix(0, atomic.LoadInt64(&lastRead))
-				if now.Sub(last) > sseIdleTimeout {
-					cancel()
-					return
-				}
-			}
-		}
-	}()
-	defer idleStop.Wait()
-
-	scanner := bufio.NewScanner(resp.Body)
-	// Raise the line budget so a very large JSON does not truncate.
-	scanner.Buffer(make([]byte, 0, 4096), 64*1024)
-	for scanner.Scan() {
-		atomic.StoreInt64(&lastRead, time.Now().UnixNano())
-		line := scanner.Text()
-		// Minimal SSE parser: we only emit "data: {...}" lines; ignore
-		// keepalive comments (":ka") and empty separator lines.
-		if !strings.HasPrefix(line, "data: ") {
-			continue
-		}
-		payload := strings.TrimPrefix(line, "data: ")
-		var evt SynEventMsg
-		if err := json.Unmarshal([]byte(payload), &evt); err != nil {
-			continue
+	for {
+		evt, err := stream.Recv()
+		if err != nil {
+			return err
 		}
 		onEvent(evt)
 	}
-	if err := scanner.Err(); err != nil && ctx.Err() == nil {
-		return err
-	}
-	if ctx.Err() != nil {
-		return fmt.Errorf("SSE idle watchdog cancelled: %w", ctx.Err())
-	}
-	return nil
 }

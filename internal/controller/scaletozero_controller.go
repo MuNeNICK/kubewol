@@ -29,7 +29,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/log"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
-	"github.com/munenick/kubewol/internal/agentapi"
+	pb "github.com/munenick/kubewol/internal/agentapi/pb"
 )
 
 const (
@@ -86,12 +86,12 @@ type WatchEntry struct {
 }
 
 // AgentFleet is the minimum interface the reconciler needs from the agent
-// discovery + fanout subsystem. Implemented by internal/agent/fleet.Fleet.
+// discovery + fanout subsystem. Implemented by controller.Fleet.
 type AgentFleet interface {
 	// PushAll sends the full desired watch state to every known agent in
 	// parallel. Errors are aggregated but do not fail the reconcile — a
 	// temporarily unreachable agent will catch up on the next reconcile.
-	PushAll(ctx context.Context, spec agentapi.WatchSpec) error
+	PushAll(ctx context.Context, spec *pb.WatchSpec) error
 }
 
 // ScaleToZeroReconciler reconciles Services annotated with kubewol/enabled=true.
@@ -244,26 +244,25 @@ func (r *ScaleToZeroReconciler) pushFleet(ctx context.Context, name types.Namesp
 	return nil
 }
 
-// buildSpecLocked snapshots the current watch map into a WatchSpec. Caller
-// must not hold r.mu; this method takes the read lock itself. rstSuppress is
-// applied to the entries for the Service being reconciled; other Services'
-// entries keep their existing RstSuppress flag (tracked by re-reading the
-// current wall clock against ReadySince).
-func (r *ScaleToZeroReconciler) buildSpecLocked(curSvcRstSuppress bool) agentapi.WatchSpec {
+// buildSpecLocked snapshots the current watch map into a pb.WatchSpec the
+// Fleet can send over gRPC. rstSuppress for the currently reconciled Service
+// is applied via ProxyMode + ReadySince comparison; other Services' entries
+// keep their existing RstSuppress flag tracked against the current wall clock.
+func (r *ScaleToZeroReconciler) buildSpecLocked(_ bool) *pb.WatchSpec {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
 	now := time.Now()
-	var out []agentapi.WatchEntry
+	var out []*pb.WatchEntry
 	for _, list := range r.watches {
 		for _, e := range list {
 			rst := e.ProxyMode || (!e.ReadySince.IsZero() && now.Sub(e.ReadySince) < rstSuppressDelay)
-			out = append(out, agentapi.WatchEntry{
+			out = append(out, &pb.WatchEntry{
 				Namespace:   e.Namespace,
 				Service:     e.Service,
 				TargetKind:  e.TargetKind,
 				TargetName:  e.TargetName,
-				ClusterIP:   e.ClusterIP.String(),
-				Port:        e.Port,
+				ClusterIp:   e.ClusterIP.String(),
+				Port:        uint32(e.Port),
 				NodePort:    e.NodePort,
 				ProxyMode:   e.ProxyMode,
 				RstSuppress: rst,
@@ -271,7 +270,7 @@ func (r *ScaleToZeroReconciler) buildSpecLocked(curSvcRstSuppress bool) agentapi
 			})
 		}
 	}
-	return agentapi.WatchSpec{Watches: out}
+	return &pb.WatchSpec{Watches: out}
 }
 
 func (r *ScaleToZeroReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {

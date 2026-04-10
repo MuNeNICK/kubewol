@@ -11,7 +11,6 @@ import (
 	"context"
 	"flag"
 	"net"
-	"net/http"
 	"os"
 	"strings"
 	"time"
@@ -20,6 +19,7 @@ import (
 
 	"k8s.io/apimachinery/pkg/runtime"
 	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
+	"k8s.io/client-go/kubernetes"
 	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/healthz"
@@ -29,7 +29,7 @@ import (
 	metricsserver "sigs.k8s.io/controller-runtime/pkg/metrics/server"
 
 	"github.com/munenick/kubewol/internal/agent"
-	"github.com/munenick/kubewol/internal/agentapi"
+	pb "github.com/munenick/kubewol/internal/agentapi/pb"
 	"github.com/munenick/kubewol/internal/controller"
 	bpf "github.com/munenick/kubewol/internal/ebpf"
 	"github.com/munenick/kubewol/internal/metrics"
@@ -43,6 +43,10 @@ var (
 func init() {
 	utilruntime.Must(clientgoscheme.AddToScheme(scheme))
 }
+
+// agentGRPCAddr is the bind address the agent's gRPC listener uses. Kept as a
+// package-level variable so runAgent can read the flag after main() parses.
+var agentGRPCAddr string
 
 func main() {
 	var mode string
@@ -74,8 +78,11 @@ func main() {
 		"Controller-only. Namespace hosting the kubewol-agent headless Service.")
 	flag.StringVar(&agentService, "agent-service", "kubewol-agent",
 		"Controller-only. Name of the kubewol-agent headless Service.")
-	flag.IntVar(&agentPort, "agent-port", 8443,
-		"Controller-only. HTTPS port that the agent exposes.")
+	flag.IntVar(&agentPort, "agent-port", 8444,
+		"Controller-only. TCP port the agent exposes its gRPC service on.")
+	flag.StringVar(&agentGRPCAddr, "agent-grpc-bind-address", ":8444",
+		"Agent-only. gRPC service bind address. Serves the kubewol.v1.Agent "+
+			"service over TLS with audience-bound TokenReview authentication.")
 
 	opts := zap.Options{Development: true}
 	opts.BindFlags(flag.CommandLine)
@@ -115,36 +122,26 @@ func runAgent(probeAddr, metricsAddr, remoteWriteURL, ifaceAllow, ifaceDeny stri
 
 	restConfig := ctrl.GetConfigOrDie()
 
-	// Build the agent (HTTP handlers + BPF state owner). Authentication and
-	// authorization for /v1/* is handled upstream by the custom metrics
-	// filter installed below, so the Agent does not need a Kubernetes
-	// client of its own.
+	// Kubernetes client for the gRPC auth interceptor's audience-bound
+	// TokenReview calls.
+	k8s, err := kubernetes.NewForConfig(restConfig)
+	if err != nil {
+		setupLog.Error(err, "unable to build kubernetes client")
+		os.Exit(1)
+	}
+
+	// Build the agent (BPF state owner + gRPC service target).
 	ag := agent.New(bpfMgr, ctrl.Log.WithName("agent"))
 
-	// Extra handlers mounted on the controller-runtime metrics server so /v1/*
-	// paths get the same TLS + TokenReview auth that /metrics already has.
-	extra := map[string]http.Handler{}
-	agMux := http.NewServeMux()
-	ag.RegisterHandlers(agMux)
-	extra[agentapi.PathWatches] = agMux
-	extra[agentapi.PathSynEvents] = agMux
-
-	// Custom metrics filter provider: same shape as the upstream
-	// metricsfilters.WithAuthenticationAndAuthorization but with an explicit
-	// APIAudiences list so audience-bound projected tokens (the controller's
-	// kubewol.io/agent-api token) and ordinary SA tokens (Prometheus scrapers
-	// hitting /metrics) both pass the TokenReview step.
-	filterProvider := agent.KubewolFilterProvider("https://kubernetes.default.svc.cluster.local")
-
 	// controller-runtime manager: no reconcilers in agent mode; we only want
-	// the secure metrics server, the liveness probes, and the signal plumbing.
+	// the secure /metrics server, the liveness probes, and the signal
+	// plumbing. The agent API is served on a separate gRPC listener below.
 	mgr, err := ctrl.NewManager(restConfig, ctrl.Options{
 		Scheme: scheme,
 		Metrics: metricsserver.Options{
 			BindAddress:    metricsAddr,
 			SecureServing:  true,
-			FilterProvider: filterProvider,
-			ExtraHandlers:  extra,
+			FilterProvider: metricsfilters.WithAuthenticationAndAuthorization,
 		},
 		HealthProbeBindAddress: probeAddr,
 		LeaderElection:         false,
@@ -175,13 +172,39 @@ func runAgent(probeAddr, metricsAddr, remoteWriteURL, ifaceAllow, ifaceDeny stri
 	// Dynamic TC attach for veth pairs created after startup.
 	go bpfMgr.WatchInterfaces(ctx, time.Second)
 
-	// Ring buffer → SSE emitter.
+	// Ring buffer → gRPC SubscribeSynEvents stream fanout.
 	reader, err := newRingbufReader(bpfMgr.SynEventsMap())
 	if err != nil {
 		setupLog.Error(err, "failed to open ringbuf reader")
 		os.Exit(1)
 	}
 	go ag.RunRingBufReader(ctx, reader)
+
+	// Start the gRPC listener for the agent API on a separate port. It
+	// shares the same audience-bound TokenReview trust boundary as the
+	// metrics server above but has its own TLS certificate (self-signed,
+	// generated in-memory by agent.GenerateSelfSignedTLSConfig).
+	tlsCfg, err := agent.GenerateSelfSignedTLSConfig()
+	if err != nil {
+		setupLog.Error(err, "generate self-signed TLS config")
+		os.Exit(1)
+	}
+	grpcSrv := agent.NewGRPCServer(ag, k8s, tlsCfg)
+	grpcListener, err := net.Listen("tcp", agentGRPCAddr)
+	if err != nil {
+		setupLog.Error(err, "gRPC listen", "addr", agentGRPCAddr)
+		os.Exit(1)
+	}
+	go func() {
+		setupLog.Info("starting agent gRPC server", "addr", agentGRPCAddr)
+		if err := grpcSrv.Serve(grpcListener); err != nil {
+			setupLog.Error(err, "gRPC Serve returned")
+		}
+	}()
+	go func() {
+		<-ctx.Done()
+		grpcSrv.GracefulStop()
+	}()
 
 	setupLog.Info("starting agent manager")
 	if err := mgr.Start(ctx); err != nil {
@@ -230,9 +253,16 @@ func runController(probeAddr, metricsAddr, agentNamespace, agentService string, 
 			}
 		}()
 	}
-	handleSyn := func(ctx context.Context, evt agentapi.SynEventMsg) {
+	handleSyn := func(ctx context.Context, evt *pb.SynEvent) {
+		if evt == nil {
+			return
+		}
 		select {
-		case scaleCh <- scaleJob{namespace: evt.Namespace, kind: evt.TargetKind, name: evt.TargetName}:
+		case scaleCh <- scaleJob{
+			namespace: evt.GetNamespace(),
+			kind:      evt.GetTargetKind(),
+			name:      evt.GetTargetName(),
+		}:
 		default:
 			// Queue full — debounce already suppresses spam so drop is safe.
 		}

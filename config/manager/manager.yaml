@@ -43,6 +43,10 @@ spec:
       port: 8443
       targetPort: 8443
       protocol: TCP
+    - name: grpc
+      port: 8444
+      targetPort: 8444
+      protocol: TCP
 ---
 apiVersion: apps/v1
 kind: DaemonSet
@@ -87,11 +91,14 @@ spec:
             - --mode=agent
             - --health-probe-bind-address=:8081
             - --metrics-bind-address=:8443
+            - --agent-grpc-bind-address=:8444
             # Enable Remote Write push for fast cold start:
             # - --remote-write-url=http://prometheus-server.monitoring.svc:80/api/v1/write
           ports:
             - containerPort: 8443
               name: https-metrics
+            - containerPort: 8444
+              name: grpc
             - containerPort: 8081
               name: healthz
           # CAP_BPF: load eBPF programs, create/update BPF maps.
@@ -233,7 +240,7 @@ spec:
             - --metrics-bind-address=:8443
             - --agent-namespace=$(POD_NAMESPACE)
             - --agent-service=kubewol-agent
-            - --agent-port=8443
+            - --agent-port=8444
           volumeMounts:
             - name: agent-api-token
               mountPath: /var/run/secrets/kubewol/agent-api

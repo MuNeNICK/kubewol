@@ -15,10 +15,11 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	"github.com/munenick/kubewol/internal/agentapi"
+	pb "github.com/munenick/kubewol/internal/agentapi/pb"
 )
 
-// SynEventHandler is invoked for every SSE event streamed from any agent.
-type SynEventHandler func(ctx context.Context, evt agentapi.SynEventMsg)
+// SynEventHandler is invoked for every gRPC stream event received from any agent.
+type SynEventHandler func(ctx context.Context, evt *pb.SynEvent)
 
 // Fleet maintains an up-to-date list of kubewol-agent pods (one per node) by
 // watching the EndpointSlices for the agent headless Service, keeps a
@@ -39,7 +40,7 @@ type Fleet struct {
 }
 
 type agentClient struct {
-	base   string // https://ip:port
+	target string // host:port
 	client *agentapi.Client
 	cancel context.CancelFunc
 }
@@ -174,17 +175,16 @@ func (f *Fleet) refresh(ctx context.Context) error {
 		if _, ok := f.clients[key]; ok {
 			continue
 		}
-		base := "https://" + key
-		c, err := agentapi.NewClient(base, "")
+		c, err := agentapi.NewClient(key, "")
 		if err != nil {
-			f.logger.Error(err, "new agent client", "base", base)
+			f.logger.Error(err, "new agent client", "target", key)
 			continue
 		}
 		subCtx, cancel := context.WithCancel(context.Background())
-		ac := &agentClient{base: base, client: c, cancel: cancel}
+		ac := &agentClient{target: key, client: c, cancel: cancel}
 		f.clients[key] = ac
 		go f.runSubscription(subCtx, ac)
-		f.logger.Info("agent registered", "base", base)
+		f.logger.Info("agent registered", "target", key)
 	}
 	// Drop stale clients.
 	for key, ac := range f.clients {
@@ -192,21 +192,22 @@ func (f *Fleet) refresh(ctx context.Context) error {
 			continue
 		}
 		ac.cancel()
+		_ = ac.client.Close()
 		delete(f.clients, key)
-		f.logger.Info("agent dropped", "base", ac.base)
+		f.logger.Info("agent dropped", "target", ac.target)
 	}
 	return nil
 }
 
-// runSubscription opens an SSE stream and reconnects with backoff until the
-// client's context is cancelled by refresh().
+// runSubscription opens a SubscribeSynEvents gRPC stream and reconnects with
+// backoff until the client's context is cancelled by refresh().
 func (f *Fleet) runSubscription(ctx context.Context, ac *agentClient) {
 	backoff := time.Second
 	for {
 		if ctx.Err() != nil {
 			return
 		}
-		err := ac.client.StreamSynEvents(ctx, func(evt agentapi.SynEventMsg) {
+		err := ac.client.StreamSynEvents(ctx, func(evt *pb.SynEvent) {
 			if f.onEvent != nil {
 				f.onEvent(ctx, evt)
 			}
@@ -215,7 +216,8 @@ func (f *Fleet) runSubscription(ctx context.Context, ac *agentClient) {
 			return
 		}
 		if err != nil {
-			f.logger.V(1).Info("SSE disconnected", "agent", ac.base, "error", err.Error())
+			f.logger.V(1).Info("syn event stream disconnected",
+				"agent", ac.target, "error", err.Error())
 		}
 		select {
 		case <-ctx.Done():
@@ -231,7 +233,7 @@ func (f *Fleet) runSubscription(ctx context.Context, ac *agentClient) {
 // PushAll fans the given WatchSpec out to every known agent in parallel.
 // Failures are logged but not returned so a single unreachable node cannot
 // stall every other reconcile.
-func (f *Fleet) PushAll(ctx context.Context, spec agentapi.WatchSpec) error {
+func (f *Fleet) PushAll(ctx context.Context, spec *pb.WatchSpec) error {
 	f.mu.Lock()
 	targets := make([]*agentClient, 0, len(f.clients))
 	for _, ac := range f.clients {
@@ -245,8 +247,6 @@ func (f *Fleet) PushAll(ctx context.Context, spec agentapi.WatchSpec) error {
 	}
 
 	var wg sync.WaitGroup
-	var errMu sync.Mutex
-	var firstErr error
 	for _, ac := range targets {
 		wg.Add(1)
 		go func(ac *agentClient) {
@@ -254,18 +254,12 @@ func (f *Fleet) PushAll(ctx context.Context, spec agentapi.WatchSpec) error {
 			cctx, cancel := context.WithTimeout(ctx, 5*time.Second)
 			defer cancel()
 			if err := ac.client.PutWatches(cctx, spec); err != nil {
-				f.logger.V(1).Info("PutWatches failed", "agent", ac.base, "error", err.Error())
-				errMu.Lock()
-				if firstErr == nil {
-					firstErr = err
-				}
-				errMu.Unlock()
+				f.logger.V(1).Info("PutWatches failed",
+					"agent", ac.target, "error", err.Error())
 			}
 		}(ac)
 	}
 	wg.Wait()
-	// Do not surface the first error; reconcile will retry on the next event.
-	_ = firstErr
 	return nil
 }
 
@@ -274,6 +268,7 @@ func (f *Fleet) closeAll() {
 	defer f.mu.Unlock()
 	for _, ac := range f.clients {
 		ac.cancel()
+		_ = ac.client.Close()
 	}
 	f.clients = map[string]*agentClient{}
 }

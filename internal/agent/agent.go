@@ -1,60 +1,79 @@
 // Package agent runs on every node inside the kubewol DaemonSet. It owns
-// the BPF programs and maps, dynamically attaches TC to new interfaces,
-// receives the desired state from the controller via HTTP, and streams
-// SYN events back so the unprivileged controller can make direct-scale
-// decisions without touching any kernel facilities.
+// the BPF programs and maps, dynamically attaches TC to new interfaces, and
+// surfaces a gRPC API (defined in proto/kubewol/v1/agent.proto) that the
+// unprivileged controller uses to push desired state and subscribe to SYN
+// events for direct-scale decisions.
 package agent
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
 	"net"
-	"net/http"
 	"sync"
-	"time"
 
 	"github.com/go-logr/logr"
 
-	"github.com/munenick/kubewol/internal/agentapi"
 	bpf "github.com/munenick/kubewol/internal/ebpf"
 	"github.com/munenick/kubewol/internal/metrics"
 )
 
 // AgentAudience is the audience the controller's projected SA token must
-// carry to pass the /v1/* audience check. A bearer token whose aud claim
-// does not include this value is rejected by the custom metrics filter
-// even if it is otherwise valid. Kept in sync with the projected volume
-// definition in the controller Deployment manifest.
+// carry to pass the gRPC authentication interceptor. A bearer token whose
+// aud claim does not include this value is rejected by the auth interceptor
+// in grpc.go regardless of who signed it. Kept in sync with the projected
+// volume definition in the controller Deployment manifest.
 const AgentAudience = "kubewol.io/agent-api"
 
-// Agent owns the BPF state and the HTTP handlers the controller calls.
+// WatchEntrySpec is the protocol-independent description of one Service
+// port the agent tracks. grpc.go translates pb.WatchEntry to this shape
+// before calling ApplyWatches so the BPF-facing logic has no direct
+// dependency on the generated protobuf types.
+type WatchEntrySpec struct {
+	Namespace   string
+	Service     string
+	TargetKind  string
+	TargetName  string
+	ClusterIP   string
+	Port        uint16
+	NodePort    int32
+	ProxyMode   bool
+	RstSuppress bool
+	DirectScale bool
+}
+
+// SynEvent is the payload the ring buffer reader emits to subscribers after
+// resolving a BPF ring buffer entry to a logical target workload.
+type SynEvent struct {
+	Namespace  string
+	TargetKind string
+	TargetName string
+}
+
+// Agent owns the BPF state and is called by the gRPC service layer in grpc.go.
 type Agent struct {
 	bpf    *bpf.Manager
 	logger logr.Logger
 
 	mu sync.Mutex
 	// entries is the last applied watch state, keyed by "namespace/service/port".
-	// The agent replaces this wholesale on every PUT /v1/watches so stale ports
-	// are torn down without the controller having to send diffs.
 	entries map[string]*entryState
-	// bpfKeyIndex maps from a BPF SvcKey back to the logical WatchEntry so the
+	// bpfKeyIndex maps from a BPF SvcKey back to the WatchEntrySpec so the
 	// ring-buffer reader can resolve SYN events to target workloads.
-	bpfKeyIndex map[bpf.SvcKey]*agentapi.WatchEntry
+	bpfKeyIndex map[bpf.SvcKey]*WatchEntrySpec
 	// nodePortIndex maps from a network-byte-order NodePort (padded to u32)
-	// back to the logical WatchEntry for NodePort traffic.
-	nodePortIndex map[uint32]*agentapi.WatchEntry
+	// back to the WatchEntrySpec for NodePort traffic.
+	nodePortIndex map[uint32]*WatchEntrySpec
 
 	// subMu protects subs.
 	subMu sync.Mutex
-	// subs is the set of live SSE subscribers — typically a single connection
-	// from the controller, but N when the controller restarts and reconnects
-	// before the old one is torn down.
-	subs map[chan agentapi.SynEventMsg]struct{}
+	// subs is the set of live SSE-style subscribers — typically a single
+	// gRPC stream from the controller, but N when the controller restarts
+	// and reconnects before the old one tears down.
+	subs map[chan SynEvent]struct{}
 }
 
 type entryState struct {
-	entry agentapi.WatchEntry
+	entry WatchEntrySpec
 	key   bpf.SvcKey
 	ip    net.IP
 }
@@ -65,65 +84,30 @@ func New(bpfMgr *bpf.Manager, logger logr.Logger) *Agent {
 		bpf:           bpfMgr,
 		logger:        logger,
 		entries:       map[string]*entryState{},
-		bpfKeyIndex:   map[bpf.SvcKey]*agentapi.WatchEntry{},
-		nodePortIndex: map[uint32]*agentapi.WatchEntry{},
-		subs:          map[chan agentapi.SynEventMsg]struct{}{},
+		bpfKeyIndex:   map[bpf.SvcKey]*WatchEntrySpec{},
+		nodePortIndex: map[uint32]*WatchEntrySpec{},
+		subs:          map[chan SynEvent]struct{}{},
 	}
 }
 
-// RegisterHandlers installs the agent HTTP routes onto the given mux.
-//
-// Authentication and authorization for every request routed here is enforced
-// upstream by the custom metrics filter in agent/filter.go: it calls
-// TokenReview with an explicit target audience list that includes
-// AgentAudience, so any bearer token whose aud claim does not include
-// kubewol.io/agent-api is rejected before the handlers ever run. No further
-// audience check is needed at this layer.
-func (a *Agent) RegisterHandlers(mux *http.ServeMux) {
-	mux.HandleFunc(agentapi.PathWatches, a.handleWatches)
-	mux.HandleFunc(agentapi.PathSynEvents, a.handleSynEvents)
-}
-
-// handleWatches accepts the full desired watch state from the controller and
-// rewrites the local BPF maps to match. Missing entries are removed; present
-// entries are (re)applied. BPF writes that fail surface as 500s so the
-// controller can retry on its next reconcile.
-func (a *Agent) handleWatches(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodPut {
-		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
-		return
-	}
-	var spec agentapi.WatchSpec
-	if err := json.NewDecoder(r.Body).Decode(&spec); err != nil {
-		http.Error(w, "bad json: "+err.Error(), http.StatusBadRequest)
-		return
-	}
-
-	if err := a.applySpec(spec); err != nil {
-		a.logger.Error(err, "applySpec failed")
-		http.Error(w, err.Error(), http.StatusInternalServerError)
-		return
-	}
-	w.WriteHeader(http.StatusNoContent)
-}
-
-func entryKey(e *agentapi.WatchEntry) string {
+func entryKey(e *WatchEntrySpec) string {
 	return fmt.Sprintf("%s/%s/%d", e.Namespace, e.Service, e.Port)
 }
 
-// applySpec diffs the incoming spec against the current state and installs
-// the difference into BPF. Lock is held for the whole call so concurrent
-// PUTs serialize cleanly.
-func (a *Agent) applySpec(spec agentapi.WatchSpec) error {
+// ApplyWatches diffs the incoming set against the current state and installs
+// the difference into BPF. The lock is held for the whole call so concurrent
+// gRPC PutWatches requests serialise cleanly.
+func (a *Agent) ApplyWatches(specs []WatchEntrySpec) error {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 
-	want := make(map[string]*entryState, len(spec.Watches))
-	for i := range spec.Watches {
-		e := spec.Watches[i]
+	want := make(map[string]*entryState, len(specs))
+	for i := range specs {
+		e := specs[i]
 		ip := net.ParseIP(e.ClusterIP)
 		if ip == nil || ip.To4() == nil {
-			a.logger.V(1).Info("skip non-IPv4 entry", "service", e.Namespace+"/"+e.Service, "ip", e.ClusterIP)
+			a.logger.V(1).Info("skip non-IPv4 entry",
+				"service", e.Namespace+"/"+e.Service, "ip", e.ClusterIP)
 			continue
 		}
 		bpfKey := bpf.SvcKey{Addr: bpf.IPToUint32Must(ip), Port: bpf.Htons(e.Port)}
@@ -158,7 +142,7 @@ func (a *Agent) applySpec(spec agentapi.WatchSpec) error {
 			return fmt.Errorf("SetRstSuppress %s: %w", k, err)
 		}
 		a.entries[k] = st
-		entry := st.entry // copy to get a stable pointer
+		entry := st.entry // copy so the index holds a stable pointer
 		a.bpfKeyIndex[st.key] = &entry
 		if st.entry.NodePort > 0 {
 			npKey := uint32(bpf.Htons(uint16(st.entry.NodePort)))
@@ -169,10 +153,10 @@ func (a *Agent) applySpec(spec agentapi.WatchSpec) error {
 	return nil
 }
 
-// lookupByBPFKey is invoked from the ring buffer reader to translate a SYN
+// lookupByBPFKey is invoked from the ring buffer reader to translate a BPF
 // event into a logical target workload. Returns nil if the SYN hit a service
 // that does not want direct-scale.
-func (a *Agent) lookupByBPFKey(dstAddr uint32, dstPort uint16) *agentapi.WatchEntry {
+func (a *Agent) lookupByBPFKey(dstAddr uint32, dstPort uint16) *WatchEntrySpec {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 
@@ -193,12 +177,12 @@ func (a *Agent) lookupByBPFKey(dstAddr uint32, dstPort uint16) *agentapi.WatchEn
 	return nil
 }
 
-// ServiceMetrics returns the per-Service cumulative SYN count aggregated from
-// the BPF syn_count map. Used by the agent's /metrics exporter.
+// ServiceMetrics returns per-Service cumulative SYN count aggregated from the
+// BPF syn_count map. Consumed by the /metrics exporter (still served over
+// HTTPS by controller-runtime's metrics server in agent mode).
 func (a *Agent) ServiceMetrics() []metrics.ServiceMetric {
 	a.mu.Lock()
 	defer a.mu.Unlock()
-	// Sum counts per Service (entries are per-port).
 	type agg struct {
 		ns, svc string
 		total   uint64
@@ -222,69 +206,34 @@ func (a *Agent) ServiceMetrics() []metrics.ServiceMetric {
 	return out
 }
 
-// DropCounts proxies to the BPF Manager.
+// DropCounts proxies to the BPF Manager. Exposed for the metrics exporter.
 func (a *Agent) DropCounts() (map[string]uint64, error) {
 	return a.bpf.DropCounts()
 }
 
-// handleSynEvents opens a Server-Sent Events stream and forwards every
-// direct-scale-eligible SYN event for as long as the client stays connected.
-func (a *Agent) handleSynEvents(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodGet {
-		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
-		return
-	}
-	flusher, ok := w.(http.Flusher)
-	if !ok {
-		http.Error(w, "streaming unsupported", http.StatusInternalServerError)
-		return
-	}
-
-	ch := make(chan agentapi.SynEventMsg, 64)
+// subscribe registers a new SynEvent channel. Used by grpc.go to back a
+// server-side stream. The returned channel is closed when unsubscribe is
+// called; no messages are dropped silently — Agent.emit instead drops to
+// per-subscriber on overflow so a slow consumer cannot stall the ring
+// buffer reader.
+func (a *Agent) subscribe() chan SynEvent {
+	ch := make(chan SynEvent, 64)
 	a.subMu.Lock()
 	a.subs[ch] = struct{}{}
 	a.subMu.Unlock()
-	defer func() {
-		a.subMu.Lock()
-		delete(a.subs, ch)
-		a.subMu.Unlock()
-		close(ch)
-	}()
+	return ch
+}
 
-	w.Header().Set("Content-Type", "text/event-stream")
-	w.Header().Set("Cache-Control", "no-cache")
-	w.Header().Set("Connection", "keep-alive")
-	w.WriteHeader(http.StatusOK)
-	flusher.Flush()
-
-	ctx := r.Context()
-	keepalive := time.NewTicker(20 * time.Second)
-	defer keepalive.Stop()
-
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		case <-keepalive.C:
-			// SSE comment line; keeps idle proxies from closing the connection.
-			_, _ = w.Write([]byte(":ka\n\n"))
-			flusher.Flush()
-		case evt := <-ch:
-			buf, err := json.Marshal(evt)
-			if err != nil {
-				continue
-			}
-			_, _ = w.Write([]byte("data: "))
-			_, _ = w.Write(buf)
-			_, _ = w.Write([]byte("\n\n"))
-			flusher.Flush()
-		}
-	}
+func (a *Agent) unsubscribe(ch chan SynEvent) {
+	a.subMu.Lock()
+	delete(a.subs, ch)
+	a.subMu.Unlock()
+	close(ch)
 }
 
 // emit pushes one event to every live subscriber, dropping for subscribers
 // whose queue is full instead of blocking the ringbuf reader.
-func (a *Agent) emit(evt agentapi.SynEventMsg) {
+func (a *Agent) emit(evt SynEvent) {
 	a.subMu.Lock()
 	defer a.subMu.Unlock()
 	for ch := range a.subs {
@@ -297,7 +246,7 @@ func (a *Agent) emit(evt agentapi.SynEventMsg) {
 }
 
 // RunRingBufReader consumes the BPF ring buffer, resolves each SYN to a
-// logical target via lookupByBPFKey, and emits an SSE event for any match
+// logical target via lookupByBPFKey, and emits a SynEvent for any match
 // that opted into direct-scale.
 func (a *Agent) RunRingBufReader(ctx context.Context, reader SynEventReader) {
 	defer reader.Close()
@@ -312,7 +261,7 @@ func (a *Agent) RunRingBufReader(ctx context.Context, reader SynEventReader) {
 			return
 		}
 		if entry := a.lookupByBPFKey(evt.DstAddr, evt.DstPort); entry != nil {
-			a.emit(agentapi.SynEventMsg{
+			a.emit(SynEvent{
 				Namespace:  entry.Namespace,
 				TargetKind: entry.TargetKind,
 				TargetName: entry.TargetName,
@@ -321,8 +270,8 @@ func (a *Agent) RunRingBufReader(ctx context.Context, reader SynEventReader) {
 	}
 }
 
-// SynEventReader is the contract satisfied by cmd-side ring buffer readers.
-// Kept as an interface so this package doesn't grow a direct cilium/ebpf dep.
+// SynEventReader is the contract the cmd-side ring buffer reader satisfies.
+// Kept as an interface so this package does not depend on cilium/ebpf.
 type SynEventReader interface {
 	ReadEvent() (bpf.SynEvent, error)
 	Close() error
