@@ -1,4 +1,4 @@
-module github.com/munenick/ebpf-scale-to-zero
+module github.com/munenick/kubewol
 
 go 1.24.5
 

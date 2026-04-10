@@ -26,9 +26,9 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/log/zap"
 	metricsserver "sigs.k8s.io/controller-runtime/pkg/metrics/server"
 
-	"github.com/munenick/ebpf-scale-to-zero/internal/controller"
-	bpf "github.com/munenick/ebpf-scale-to-zero/internal/ebpf"
-	"github.com/munenick/ebpf-scale-to-zero/internal/metrics"
+	"github.com/munenick/kubewol/internal/controller"
+	bpf "github.com/munenick/kubewol/internal/ebpf"
+	"github.com/munenick/kubewol/internal/metrics"
 	// +kubebuilder:scaffold:imports
 )
 

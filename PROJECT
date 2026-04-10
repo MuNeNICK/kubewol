@@ -6,8 +6,8 @@ cliVersion: 4.8.0
 domain: munenick.dev
 layout:
 - go.kubebuilder.io/v4
-projectName: ebpf-scale-to-zero
-repo: github.com/munenick/ebpf-scale-to-zero
+projectName: kubewol
+repo: github.com/munenick/kubewol
 resources:
 - api:
     crdVersion: v1
@@ -16,6 +16,6 @@ resources:
   domain: munenick.dev
   group: ebpf
   kind: ScaleToZero
-  path: github.com/munenick/ebpf-scale-to-zero/api/v1alpha1
+  path: github.com/munenick/kubewol/api/v1alpha1
   version: v1alpha1
 version: "3"

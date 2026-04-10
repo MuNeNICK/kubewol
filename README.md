@@ -1,135 +1,147 @@
-# ebpf-scale-to-zero
-// TODO(user): Add simple overview of use/purpose
+# kubewol
 
-## Description
-// TODO(user): An in-depth paragraph about your project and overview of use
+Wake-on-LAN for Kubernetes. eBPF detects TCP SYN and wakes scaled-to-zero workloads.
 
-## Getting Started
+kubewol enables true scale-to-zero for Kubernetes workloads by combining eBPF traffic observation with the [HPA `HPAScaleToZero` feature gate](https://kubernetes.io/docs/reference/command-line-tools-reference/feature-gates/) (Alpha since v1.16, [improved in v1.36](https://github.com/kubernetes/kubernetes/pull/135118)).
 
-### Prerequisites
-- go version v1.24.0+
-- docker version 17.03+.
-- kubectl version v1.11.3+.
-- Access to a Kubernetes v1.11.3+ cluster.
+## How it works
 
-### To Deploy on the cluster
-**Build and push your image to the location specified by `IMG`:**
-
-```sh
-make docker-build docker-push IMG=<some-registry>/ebpf-scale-to-zero:tag
+```
+Client ── SYN ──> [ TC ingress: eBPF ] ── SYN DROP (no conntrack pollution)
+                         |
+                   SYN count -> External Metrics API -> HPA scales 0->N
+                         |
+                   [ TC egress: eBPF ] ── RST/ICMP suppression (fallback)
+                         |
+          Pod Ready -> proxy_mode OFF -> SYN passes through -> connection established
 ```
 
-**NOTE:** This image ought to be published in the personal registry you specified.
-And it is required to have access to pull the image from the working environment.
-Make sure you have the proper permission to the registry if the above commands don’t work.
+- **No proxy, no sidecar.** Request path is unchanged: `Client -> Service -> Pod`.
+- **No Prometheus required.** kubewol serves the External Metrics API directly from BPF maps.
+- **TCP connection is preserved.** SYN is silently dropped (not rejected), so the client's TCP stack retransmits. Once the Pod is ready, the retransmit succeeds on the same socket.
 
-**Install the CRDs into the cluster:**
+## Prerequisites
 
-```sh
-make install
+- Kubernetes **v1.36+** with `HPAScaleToZero=true` feature gate enabled
+- Linux kernel **6.6+** (for TCX BPF link support)
+
+## Install
+
+```bash
+kubectl apply -f https://github.com/munenick/kubewol/releases/latest/download/install.yaml
 ```
 
-**Deploy the Manager to the cluster with the image specified by `IMG`:**
+Or build from source:
 
-```sh
-make deploy IMG=<some-registry>/ebpf-scale-to-zero:tag
+```bash
+# Compile eBPF (requires clang + kernel headers)
+clang -O2 -g -target bpf -D__TARGET_ARCH_x86 -I/usr/include \
+  -c bpf/monitor.c -o internal/ebpf/monitor.o
+
+# Deploy
+make docker-build IMG=ghcr.io/munenick/kubewol:latest
+make deploy IMG=ghcr.io/munenick/kubewol:latest
 ```
 
-> **NOTE**: If you encounter RBAC errors, you may need to grant yourself cluster-admin
-privileges or be logged in as admin.
+## Usage
 
-**Create instances of your solution**
-You can apply the samples (examples) from the config/sample:
+### 1. Annotate the Service
 
-```sh
-kubectl apply -k config/samples/
+```bash
+kubectl annotate svc my-app kubewol/enabled=true
 ```
 
->**NOTE**: Ensure that the samples has default values to test it out.
+That's it. kubewol will start monitoring TCP SYN traffic to this Service.
 
-### To Uninstall
-**Delete the instances (CRs) from the cluster:**
+Optional: if the Deployment name differs from the Service name:
 
-```sh
-kubectl delete -k config/samples/
+```bash
+kubectl annotate svc my-app kubewol/deployment=my-deploy
 ```
 
-**Delete the APIs(CRDs) from the cluster:**
+### 2. Create an HPA with `minReplicas: 0`
 
-```sh
-make uninstall
+```yaml
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: my-app
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: my-app
+  minReplicas: 0
+  maxReplicas: 10
+  metrics:
+    - type: External
+      external:
+        metric:
+          name: ebpf_service_syn_total
+        target:
+          type: Value
+          value: "1"
+  behavior:
+    scaleDown:
+      stabilizationWindowSeconds: 30
+      policies:
+        - type: Percent
+          value: 100
+          periodSeconds: 15
+    scaleUp:
+      stabilizationWindowSeconds: 0
+      selectPolicy: Max
+      policies:
+        - type: Percent
+          value: 100
+          periodSeconds: 15
+        - type: Pods
+          value: 5
+          periodSeconds: 15
 ```
 
-**UnDeploy the controller from the cluster:**
+> **Important:** The `scaleUp` section must include a `Pods` type policy. A `Percent`-only policy cannot scale from 0 (100% of 0 = 0).
 
-```sh
-make undeploy
+### 3. Done
+
+When no traffic arrives, HPA scales the Deployment to 0. When a TCP SYN is detected:
+
+1. kubewol counts it and exposes via External Metrics API
+2. HPA sees `ebpf_service_syn_total > 0` and scales up
+3. The client's TCP connection is preserved through SYN retransmit
+
+## Annotations
+
+| Annotation | Required | Default | Description |
+|---|---|---|---|
+| `kubewol/enabled` | Yes | - | Set to `"true"` to enable monitoring |
+| `kubewol/deployment` | No | Service name | Deployment name if different from Service |
+
+## Architecture
+
+```
+kubewol DaemonSet (one per node)
+  |
+  +-- TC ingress (eBPF)
+  |     SYN counting
+  |     SYN DROP when no endpoints (preserves TCP connection)
+  |
+  +-- TC egress (eBPF)
+  |     RST/ICMP suppression (race condition fallback)
+  |
+  +-- controller-runtime Reconciler
+  |     Watches: Service (annotation), EndpointSlice (proxy_mode)
+  |
+  +-- External Metrics API server (:6443)
+        BPF map -> windowed SYN count -> HPA
 ```
 
-## Project Distribution
+## Uninstall
 
-Following the options to release and provide this solution to the users.
-
-### By providing a bundle with all YAML files
-
-1. Build the installer for the image built and published in the registry:
-
-```sh
-make build-installer IMG=<some-registry>/ebpf-scale-to-zero:tag
+```bash
+kubectl delete -f https://github.com/munenick/kubewol/releases/latest/download/install.yaml
 ```
-
-**NOTE:** The makefile target mentioned above generates an 'install.yaml'
-file in the dist directory. This file contains all the resources built
-with Kustomize, which are necessary to install this project without its
-dependencies.
-
-2. Using the installer
-
-Users can just run 'kubectl apply -f <URL for YAML BUNDLE>' to install
-the project, i.e.:
-
-```sh
-kubectl apply -f https://raw.githubusercontent.com/<org>/ebpf-scale-to-zero/<tag or branch>/dist/install.yaml
-```
-
-### By providing a Helm Chart
-
-1. Build the chart using the optional helm plugin
-
-```sh
-kubebuilder edit --plugins=helm/v1-alpha
-```
-
-2. See that a chart was generated under 'dist/chart', and users
-can obtain this solution from there.
-
-**NOTE:** If you change the project, you need to update the Helm Chart
-using the same command above to sync the latest changes. Furthermore,
-if you create webhooks, you need to use the above command with
-the '--force' flag and manually ensure that any custom configuration
-previously added to 'dist/chart/values.yaml' or 'dist/chart/manager/manager.yaml'
-is manually re-applied afterwards.
-
-## Contributing
-// TODO(user): Add detailed information on how you would like others to contribute to this project
-
-**NOTE:** Run `make help` for more information on all potential `make` targets
-
-More information can be found via the [Kubebuilder Documentation](https://book.kubebuilder.io/introduction.html)
 
 ## License
 
-Copyright 2026.
-
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-
+Apache License 2.0

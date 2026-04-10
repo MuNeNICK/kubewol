@@ -22,18 +22,18 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/log"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
-	bpf "github.com/munenick/ebpf-scale-to-zero/internal/ebpf"
-	"github.com/munenick/ebpf-scale-to-zero/internal/metrics"
+	bpf "github.com/munenick/kubewol/internal/ebpf"
+	"github.com/munenick/kubewol/internal/metrics"
 )
 
 const (
 	// AnnotationEnabled marks a Service for eBPF scale-to-zero monitoring.
-	//   kubectl annotate svc demo-app ebpf-scale-to-zero/enabled=true
-	AnnotationEnabled = "ebpf-scale-to-zero/enabled"
+	//   kubectl annotate svc demo-app kubewol/enabled=true
+	AnnotationEnabled = "kubewol/enabled"
 
 	// AnnotationDeployment overrides the Deployment name (default: same as Service name).
-	//   kubectl annotate svc demo-app ebpf-scale-to-zero/deployment=my-deploy
-	AnnotationDeployment = "ebpf-scale-to-zero/deployment"
+	//   kubectl annotate svc demo-app kubewol/deployment=my-deploy
+	AnnotationDeployment = "kubewol/deployment"
 )
 
 // WatchEntry tracks BPF state for one Service.
@@ -48,7 +48,7 @@ type WatchEntry struct {
 	ProxyMode  bool
 }
 
-// ScaleToZeroReconciler reconciles Services annotated with ebpf-scale-to-zero/enabled=true.
+// ScaleToZeroReconciler reconciles Services annotated with kubewol/enabled=true.
 type ScaleToZeroReconciler struct {
 	client.Client
 	Scheme *runtime.Scheme

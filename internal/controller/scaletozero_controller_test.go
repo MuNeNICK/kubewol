@@ -27,7 +27,7 @@ import (
 
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
-	ebpfv1alpha1 "github.com/munenick/ebpf-scale-to-zero/api/v1alpha1"
+	ebpfv1alpha1 "github.com/munenick/kubewol/api/v1alpha1"
 )
 
 var _ = Describe("ScaleToZero Controller", func() {

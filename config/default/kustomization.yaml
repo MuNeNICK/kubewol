@@ -1,6 +1,6 @@
-namespace: ebpf-scale-to-zero-system
+namespace: kubewol-system
 
-namePrefix: ebpf-scale-to-zero-
+namePrefix: kubewol-
 
 resources:
   - ../rbac

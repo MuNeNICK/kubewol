@@ -32,7 +32,7 @@ import (
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
 	"sigs.k8s.io/controller-runtime/pkg/log/zap"
 
-	ebpfv1alpha1 "github.com/munenick/ebpf-scale-to-zero/api/v1alpha1"
+	ebpfv1alpha1 "github.com/munenick/kubewol/api/v1alpha1"
 	// +kubebuilder:scaffold:imports
 )
 

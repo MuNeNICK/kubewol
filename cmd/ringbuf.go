@@ -10,7 +10,7 @@ import (
 	"github.com/cilium/ebpf"
 	"github.com/cilium/ebpf/ringbuf"
 
-	bpf "github.com/munenick/ebpf-scale-to-zero/internal/ebpf"
+	bpf "github.com/munenick/kubewol/internal/ebpf"
 )
 
 type ringbufReader struct {

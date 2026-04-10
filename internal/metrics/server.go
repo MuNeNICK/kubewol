@@ -130,7 +130,7 @@ func selfSignedTLS() (*tls.Config, error) {
 	}
 	tmpl := &x509.Certificate{
 		SerialNumber: big.NewInt(1),
-		Subject:      pkix.Name{CommonName: "ebpf-scale-to-zero"},
+		Subject:      pkix.Name{CommonName: "kubewol"},
 		NotBefore:    time.Now(),
 		NotAfter:     time.Now().Add(10 * 365 * 24 * time.Hour),
 		KeyUsage:     x509.KeyUsageDigitalSignature,

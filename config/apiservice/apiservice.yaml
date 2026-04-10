@@ -6,7 +6,7 @@ metadata:
 spec:
   selector:
     control-plane: controller-manager
-    app.kubernetes.io/name: ebpf-scale-to-zero
+    app.kubernetes.io/name: kubewol
   ports:
     - port: 443
       targetPort: 6443

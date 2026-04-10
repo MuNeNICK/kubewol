@@ -28,7 +28,7 @@ import (
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
 
-	"github.com/munenick/ebpf-scale-to-zero/test/utils"
+	"github.com/munenick/kubewol/test/utils"
 )
 
 var (
@@ -42,7 +42,7 @@ var (
 
 	// projectImage is the name of the image which will be build and loaded
 	// with the code source changes to be tested.
-	projectImage = "example.com/ebpf-scale-to-zero:v0.0.1"
+	projectImage = "example.com/kubewol:v0.0.1"
 )
 
 // TestE2E runs the end-to-end (e2e) test suite for the project. These tests execute in an isolated,
@@ -51,7 +51,7 @@ var (
 // CertManager.
 func TestE2E(t *testing.T) {
 	RegisterFailHandler(Fail)
-	_, _ = fmt.Fprintf(GinkgoWriter, "Starting ebpf-scale-to-zero integration test suite\n")
+	_, _ = fmt.Fprintf(GinkgoWriter, "Starting kubewol integration test suite\n")
 	RunSpecs(t, "e2e suite")
 }
 
