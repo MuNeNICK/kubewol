@@ -17,6 +17,55 @@ struct icmphdr_min {
     __u32 un;
 };
 
+// ICMP destination unreachable codes we care about.
+// ICMP_DEST_UNREACH (type 3) is broad; we only suppress code 3 (port unreachable),
+// which is what kube-proxy emits. Other codes such as fragmentation-needed (code 4)
+// carry real network signals and must not be dropped.
+#define ICMP_TYPE_DEST_UNREACH 3
+#define ICMP_CODE_PORT_UNREACH 3
+
+// 802.1Q / 802.1AD VLAN tag control information (TCI + next ethertype).
+struct vlan_hdr {
+    __u16 tci;
+    __u16 ethertype;
+};
+
+#ifndef ETH_P_8021Q
+#define ETH_P_8021Q  0x8100
+#endif
+#ifndef ETH_P_8021AD
+#define ETH_P_8021AD 0x88A8
+#endif
+
+// parse_l3 skips the Ethernet header and up to two VLAN tags and returns the
+// offset of the IPv4 header. Returns 0 if the packet is not IPv4 or is malformed.
+static __always_inline __u32 parse_l3(void *data, void *data_end)
+{
+    struct ethhdr *eth = data;
+    if ((void *)(eth + 1) > data_end)
+        return 0;
+    __u16 proto = eth->h_proto;
+    __u32 off = sizeof(*eth);
+
+    // Unwind up to two stacked VLAN tags (802.1Q / 802.1AD).
+    #pragma unroll
+    for (int i = 0; i < 2; i++) {
+        if (proto != bpf_htons(ETH_P_8021Q) && proto != bpf_htons(ETH_P_8021AD))
+            break;
+        struct vlan_hdr *vh = data + off;
+        if ((void *)(vh + 1) > data_end)
+            return 0;
+        proto = vh->ethertype;
+        off += sizeof(*vh);
+    }
+
+    if (proto != bpf_htons(ETH_P_IP))
+        return 0;
+    if (data + off + sizeof(struct iphdr) > data_end)
+        return 0;
+    return off;
+}
+
 // Key: Service ClusterIP + port
 struct svc_key {
     __u32 addr; // network byte order
@@ -107,13 +156,11 @@ int traffic_monitor(struct __sk_buff *skb)
     void *data     = (void *)(long)skb->data;
     void *data_end = (void *)(long)skb->data_end;
 
-    struct ethhdr *eth = data;
-    if ((void *)(eth + 1) > data_end)
-        return TC_ACT_OK;
-    if (eth->h_proto != bpf_htons(ETH_P_IP))
+    __u32 l3_off = parse_l3(data, data_end);
+    if (l3_off == 0)
         return TC_ACT_OK;
 
-    struct iphdr *ip = (void *)(eth + 1);
+    struct iphdr *ip = data + l3_off;
     if ((void *)(ip + 1) > data_end)
         return TC_ACT_OK;
     if (ip->protocol != IPPROTO_TCP)
@@ -207,13 +254,11 @@ int egress_rst_filter(struct __sk_buff *skb)
     void *data     = (void *)(long)skb->data;
     void *data_end = (void *)(long)skb->data_end;
 
-    struct ethhdr *eth = data;
-    if ((void *)(eth + 1) > data_end)
-        return TC_ACT_OK;
-    if (eth->h_proto != bpf_htons(ETH_P_IP))
+    __u32 l3_off = parse_l3(data, data_end);
+    if (l3_off == 0)
         return TC_ACT_OK;
 
-    struct iphdr *ip = (void *)(eth + 1);
+    struct iphdr *ip = data + l3_off;
     if ((void *)(ip + 1) > data_end)
         return TC_ACT_OK;
 
@@ -248,13 +293,15 @@ int egress_rst_filter(struct __sk_buff *skb)
             return TC_ACT_SHOT;
         }
     } else if (ip->protocol == IPPROTO_ICMP) {
-        // ICMP destination unreachable might also be sent
+        // ICMP destination unreachable might also be sent by kube-proxy REJECT.
         struct icmphdr_min *icmp = (void *)ip + ip_hlen;
         if ((void *)(icmp + 1) > data_end)
             return TC_ACT_OK;
 
-        // Type 3 = destination unreachable
-        if (icmp->type != 3)
+        // Only suppress type 3 code 3 (port unreachable). Other codes, especially
+        // code 4 (fragmentation needed), carry real network signals and must not
+        // be dropped or Path MTU discovery breaks.
+        if (icmp->type != ICMP_TYPE_DEST_UNREACH || icmp->code != ICMP_CODE_PORT_UNREACH)
             return TC_ACT_OK;
 
         // The ICMP payload contains the original IP header + 8 bytes
