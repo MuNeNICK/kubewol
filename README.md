@@ -53,10 +53,11 @@ kubectl annotate svc my-app kubewol/enabled=true
 
 That's it. kubewol will start monitoring TCP SYN traffic to this Service.
 
-Optional: if the Deployment name differs from the Service name:
+Optional: if the target workload name differs from the Service name. Both
+Deployment and StatefulSet are auto-detected:
 
 ```bash
-kubectl annotate svc my-app kubewol/deployment=my-deploy
+kubectl annotate svc my-app kubewol/target-name=my-workload
 ```
 
 ### 2. Configure Prometheus Adapter
@@ -172,10 +173,10 @@ Useful when:
 
 ## Securing the metrics endpoint
 
-The DaemonSet binds `/metrics` to `hostPort: 9090` on every node. Anything on the node network can scrape service names and SYN counts unless restricted. Apply the provided NetworkPolicy and label your Prometheus namespace:
+The DaemonSet binds `/metrics` to port 9090 on every node (via `hostNetwork: true`). The endpoint is unauthenticated; anything on the node network can scrape service names and SYN counts unless restricted. Apply the provided NetworkPolicy and label your Prometheus namespace:
 
 ```bash
-kubectl apply -f config/network-policy/allow-metrics-traffic.yaml
+kubectl apply -f https://github.com/munenick/kubewol/releases/latest/download/metrics-network-policy.yaml
 kubectl label ns monitoring kubewol-metrics=scraper
 ```
 
@@ -188,6 +189,15 @@ Only pods in namespaces labeled `kubewol-metrics=scraper` will be able to reach 
 | `--metrics-bind-address` | `:9090` | Prometheus /metrics bind address |
 | `--health-probe-bind-address` | `:8081` | Health probe bind address |
 | `--remote-write-url` | (disabled) | Prometheus Remote Write URL for fast cold start push (e.g. `http://prometheus:9090/api/v1/write`) |
+| `--tc-iface-allow` | (empty = all non-loopback) | Comma-separated interface name prefixes to attach TC to. Use on bridge-based CNIs (e.g. `cni0,eth0`) if SYN counts double-count. |
+| `--tc-iface-deny` | (empty) | Comma-separated interface name prefixes to EXCLUDE from TC attach. |
+
+### Exported metrics
+
+| Metric | Labels | Description |
+|---|---|---|
+| `ebpf_service_syn_total` | `namespace`, `service` | Cumulative TCP SYN count observed by eBPF. Used by HPA external metrics. |
+| `kubewol_bpf_drop_total` | `reason` | BPF hot-path failures (e.g. `syn_count_update` map full, `ringbuf_reserve` ring full). Non-zero means SYN events are being lost; scale up `max_entries` or scrape faster. |
 
 ## Fast cold start with Remote Write
 
@@ -211,7 +221,7 @@ kubewol DaemonSet (one per node, read-only RBAC)
   |     proxy_mode map: SYN counting + SYN DROP when no endpoints
   |
   +-- TC egress (eBPF)
-  |     rst_suppress map: RST/ICMP DROP (stays ON 5s after proxy_mode OFF
+  |     rst_suppress map: RST/ICMP DROP (stays ON 2s after proxy_mode OFF
   |                       to cover kube-proxy iptables propagation delay)
   |
   +-- controller-runtime Reconciler
