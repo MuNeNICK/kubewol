@@ -7,18 +7,17 @@ kubewol is an eBPF-based traffic sensor and Prometheus exporter that enables HPA
 ## How it works
 
 ```
-Client ── SYN ──> [ TC ingress: eBPF ] ── SYN DROP (no conntrack pollution)
-                         |
-                   SYN count -> Prometheus -> Prometheus Adapter -> HPA scales 0->N
-                         |
-                   [ TC egress: eBPF ] ── RST/ICMP suppression (fallback)
-                         |
-          Pod Ready -> proxy_mode OFF -> SYN retransmit passes through -> connection established
+replicas=0:
+  Client ── SYN ──> eBPF silently holds the connection
+                    SYN count → Prometheus → HPA scales 0→N
+
+Pod Ready:
+  SYN retransmit → Pod → connection established (same TCP socket)
 ```
 
 - **No proxy, no sidecar.** Request path is unchanged: `Client -> Service -> Pod`.
-- **Prometheus native.** Standard /metrics exporter + optional Remote Write for fast cold start. No APIService conflict with other metrics providers.
-- **TCP connection preserved.** SYN is silently dropped (not rejected), so the client's TCP stack retransmits. Once the Pod is ready, the retransmit succeeds on the same socket.
+- **Prometheus native.** Standard /metrics exporter + optional Remote Write for fast cold start. Compatible with existing metrics providers.
+- **TCP connection preserved.** The client's TCP connection survives the cold start transparently. No reconnection or retry logic needed.
 
 ## Prerequisites
 
@@ -164,13 +163,15 @@ When a SYN is detected for a scaled-to-zero service, kubewol immediately pushes 
 kubewol DaemonSet (one per node, read-only RBAC)
   |
   +-- TC ingress (eBPF)
-  |     SYN counting + SYN DROP when no endpoints
+  |     proxy_mode map: SYN counting + SYN DROP when no endpoints
   |
   +-- TC egress (eBPF)
-  |     RST/ICMP suppression (race condition fallback)
+  |     rst_suppress map: RST/ICMP DROP (stays ON 5s after proxy_mode OFF
+  |                       to cover kube-proxy iptables propagation delay)
   |
   +-- controller-runtime Reconciler
-  |     Watches: Service (annotation), EndpointSlice (proxy_mode toggle)
+  |     Watches: Service (annotation) -> BPF watch map
+  |     Watches: EndpointSlice        -> proxy_mode / rst_suppress toggle
   |
   +-- Prometheus exporter (:9090/metrics)
   |     ebpf_service_syn_total counter from BPF map
