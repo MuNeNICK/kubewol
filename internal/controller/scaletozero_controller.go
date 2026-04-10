@@ -1,0 +1,220 @@
+/*
+Copyright 2026.
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+*/
+
+package controller
+
+import (
+	"context"
+	"net"
+	"sync"
+
+	corev1 "k8s.io/api/core/v1"
+	discoveryv1 "k8s.io/api/discovery/v1"
+	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/types"
+	ctrl "sigs.k8s.io/controller-runtime"
+	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/handler"
+	"sigs.k8s.io/controller-runtime/pkg/log"
+	"sigs.k8s.io/controller-runtime/pkg/reconcile"
+
+	bpf "github.com/munenick/ebpf-scale-to-zero/internal/ebpf"
+	"github.com/munenick/ebpf-scale-to-zero/internal/metrics"
+)
+
+const (
+	// AnnotationEnabled marks a Service for eBPF scale-to-zero monitoring.
+	//   kubectl annotate svc demo-app ebpf-scale-to-zero/enabled=true
+	AnnotationEnabled = "ebpf-scale-to-zero/enabled"
+
+	// AnnotationDeployment overrides the Deployment name (default: same as Service name).
+	//   kubectl annotate svc demo-app ebpf-scale-to-zero/deployment=my-deploy
+	AnnotationDeployment = "ebpf-scale-to-zero/deployment"
+)
+
+// WatchEntry tracks BPF state for one Service.
+type WatchEntry struct {
+	Namespace  string
+	Service    string
+	Deployment string
+	ClusterIP  net.IP
+	Port       uint16
+	NodePort   int32
+	BPFKey     bpf.SvcKey
+	ProxyMode  bool
+}
+
+// ScaleToZeroReconciler reconciles Services annotated with ebpf-scale-to-zero/enabled=true.
+type ScaleToZeroReconciler struct {
+	client.Client
+	Scheme *runtime.Scheme
+	BPF    *bpf.Manager
+	Snap   *metrics.Snapshotter
+
+	mu      sync.RWMutex
+	watches map[types.NamespacedName]*WatchEntry // svc ns/name -> entry
+}
+
+// +kubebuilder:rbac:groups="",resources=services,verbs=get;list;watch
+// +kubebuilder:rbac:groups=discovery.k8s.io,resources=endpointslices,verbs=list;watch
+// +kubebuilder:rbac:groups="",resources=pods,verbs=list
+
+// Reconcile handles Service create/update/delete.
+func (r *ScaleToZeroReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
+	logger := log.FromContext(ctx)
+
+	var svc corev1.Service
+	if err := r.Get(ctx, req.NamespacedName, &svc); err != nil {
+		// Service deleted -> remove from BPF
+		r.removeWatch(req.NamespacedName)
+		return ctrl.Result{}, client.IgnoreNotFound(err)
+	}
+
+	// Check annotation
+	if svc.Annotations[AnnotationEnabled] != "true" {
+		r.removeWatch(req.NamespacedName)
+		return ctrl.Result{}, nil
+	}
+
+	if svc.Spec.ClusterIP == "" || svc.Spec.ClusterIP == "None" {
+		return ctrl.Result{}, nil
+	}
+	ip := net.ParseIP(svc.Spec.ClusterIP)
+	if ip == nil {
+		return ctrl.Result{}, nil
+	}
+
+	deployName := svc.Annotations[AnnotationDeployment]
+	if deployName == "" {
+		deployName = svc.Name
+	}
+
+	var port uint16
+	var nodePort int32
+	for _, p := range svc.Spec.Ports {
+		if p.Protocol == corev1.ProtocolTCP || p.Protocol == "" {
+			port = uint16(p.Port)
+			nodePort = p.NodePort
+			break
+		}
+	}
+	if port == 0 {
+		return ctrl.Result{}, nil
+	}
+
+	bpfKey, err := r.BPF.AddWatch(ip, port, nodePort)
+	if err != nil {
+		return ctrl.Result{}, err
+	}
+
+	ready := r.countReadyEndpoints(ctx, svc.Namespace, svc.Name)
+	proxyMode := ready == 0
+	r.BPF.SetProxyMode(bpfKey, proxyMode, nodePort)
+
+	r.mu.Lock()
+	r.watches[req.NamespacedName] = &WatchEntry{
+		Namespace: svc.Namespace, Service: svc.Name,
+		Deployment: deployName, ClusterIP: ip, Port: port,
+		NodePort: nodePort, BPFKey: bpfKey, ProxyMode: proxyMode,
+	}
+	r.mu.Unlock()
+
+	logger.Info("reconciled",
+		"service", svc.Name, "clusterIP", svc.Spec.ClusterIP,
+		"port", port, "nodePort", nodePort, "proxyMode", proxyMode)
+
+	return ctrl.Result{}, nil
+}
+
+func (r *ScaleToZeroReconciler) removeWatch(name types.NamespacedName) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if e, ok := r.watches[name]; ok {
+		r.BPF.RemoveWatch(e.ClusterIP, e.Port, e.NodePort)
+		delete(r.watches, name)
+	}
+}
+
+func (r *ScaleToZeroReconciler) countReadyEndpoints(ctx context.Context, ns, svcName string) int {
+	var list discoveryv1.EndpointSliceList
+	if err := r.List(ctx, &list, client.InNamespace(ns),
+		client.MatchingLabels{"kubernetes.io/service-name": svcName}); err != nil {
+		return -1
+	}
+	n := 0
+	for _, eps := range list.Items {
+		for _, ep := range eps.Endpoints {
+			if ep.Conditions.Ready != nil && *ep.Conditions.Ready {
+				n += len(ep.Addresses)
+			}
+		}
+	}
+	return n
+}
+
+// RecordSnapshot captures BPF SYN counts for windowed metrics.
+func (r *ScaleToZeroReconciler) RecordSnapshot() {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	counts := make(map[string]uint64)
+	for _, e := range r.watches {
+		counts[e.Namespace+"/"+e.Service] += r.BPF.ReadSynCount(e.BPFKey)
+	}
+	r.Snap.Record(counts)
+}
+
+// MetricsProvider returns the Provider for the External Metrics API.
+func (r *ScaleToZeroReconciler) MetricsProvider() metrics.Provider {
+	return func() []metrics.ServiceMetric {
+		windowed := r.Snap.Windowed()
+		r.mu.RLock()
+		defer r.mu.RUnlock()
+		seen := map[string]bool{}
+		var out []metrics.ServiceMetric
+		for _, e := range r.watches {
+			k := e.Namespace + "/" + e.Service
+			if seen[k] {
+				continue
+			}
+			seen[k] = true
+			var c uint64
+			if windowed != nil {
+				c = windowed[k]
+			}
+			out = append(out, metrics.ServiceMetric{
+				Namespace: e.Namespace, Service: e.Service, Count: c,
+			})
+		}
+		return out
+	}
+}
+
+// SetupWithManager registers the controller.
+func (r *ScaleToZeroReconciler) SetupWithManager(mgr ctrl.Manager) error {
+	if r.watches == nil {
+		r.watches = make(map[types.NamespacedName]*WatchEntry)
+	}
+	return ctrl.NewControllerManagedBy(mgr).
+		For(&corev1.Service{}).
+		Watches(&discoveryv1.EndpointSlice{},
+			handler.EnqueueRequestsFromMapFunc(r.mapEndpointSlice)).
+		Named("scaletozero").
+		Complete(r)
+}
+
+func (r *ScaleToZeroReconciler) mapEndpointSlice(_ context.Context, obj client.Object) []reconcile.Request {
+	svcName := obj.GetLabels()["kubernetes.io/service-name"]
+	if svcName == "" {
+		return nil
+	}
+	return []reconcile.Request{{
+		NamespacedName: types.NamespacedName{
+			Namespace: obj.GetNamespace(),
+			Name:      svcName,
+		},
+	}}
+}

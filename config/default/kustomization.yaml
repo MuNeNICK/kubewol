@@ -1,0 +1,8 @@
+namespace: ebpf-scale-to-zero-system
+
+namePrefix: ebpf-scale-to-zero-
+
+resources:
+  - ../rbac
+  - ../manager
+  - ../apiservice

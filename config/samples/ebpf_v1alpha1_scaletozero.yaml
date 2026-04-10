@@ -1,0 +1,9 @@
+apiVersion: ebpf.munenick.dev/v1alpha1
+kind: ScaleToZero
+metadata:
+  name: demo-app
+  namespace: default
+spec:
+  serviceRef: demo-app
+  deploymentRef: demo-app
+  metricsWindowSeconds: 60
