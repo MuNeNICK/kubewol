@@ -69,7 +69,9 @@ jobs:
 
       - name: Generate install manifest
         run: |
-          cd config/manager && kustomize edit set image controller=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ github.ref_name }}
+          IMAGE_LC=$(echo "${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}" | tr '[:upper:]' '[:lower:]')
+          VERSION="${GITHUB_REF_NAME#v}"
+          cd config/manager && kustomize edit set image controller="${IMAGE_LC}:${VERSION}"
           cd ../..
           kustomize build config/default > install.yaml
 
