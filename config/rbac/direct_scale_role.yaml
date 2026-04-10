@@ -1,0 +1,42 @@
+---
+# ClusterRole for the direct-scale fast path.
+#
+# This role grants write access to the /scale subresource on Deployments and
+# StatefulSets across the cluster. It is NOT applied by default because that
+# is a significant privilege: a compromise of the controller pod yields the
+# ability to scale any workload in the cluster.
+#
+# Apply this only if you want direct-scale (sub-second 0->1 trigger).
+# Without it, kubewol still observes traffic and feeds Prometheus metrics to
+# HPA, which handles scaling with normal HPA credentials.
+#
+# Usage:
+#   kubectl apply -f https://.../direct_scale_role.yaml
+#   kubectl apply -f https://.../direct_scale_role_binding.yaml
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: kubewol-direct-scale
+  labels:
+    app.kubernetes.io/name: kubewol
+    app.kubernetes.io/component: direct-scale
+rules:
+  - apiGroups: ["apps"]
+    resources: ["deployments/scale", "statefulsets/scale"]
+    verbs: ["get", "update", "patch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: kubewol-direct-scale
+  labels:
+    app.kubernetes.io/name: kubewol
+    app.kubernetes.io/component: direct-scale
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: kubewol-direct-scale
+subjects:
+  - kind: ServiceAccount
+    name: kubewol-controller-manager
+    namespace: kubewol-system

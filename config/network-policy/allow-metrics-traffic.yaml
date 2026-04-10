@@ -1,14 +1,21 @@
-# This NetworkPolicy allows ingress traffic
-# with Pods running on namespaces labeled with 'metrics: enabled'. Only Pods on those
-# namespaces are able to gather data from the metrics endpoint.
+# Restricts ingress to the kubewol /metrics endpoint (port 9090).
+#
+# Because the DaemonSet runs with hostNetwork: true and binds to hostPort 9090,
+# metrics are reachable via the node IP. Without this NetworkPolicy, anything
+# with routing to the node network (other pods, other nodes, or out-of-cluster
+# clients on the pod network) can scrape service names and SYN counts.
+#
+# Label your Prometheus namespace with `kubewol-metrics=scraper` to allow
+# scraping from it:
+#   kubectl label ns monitoring kubewol-metrics=scraper
 apiVersion: networking.k8s.io/v1
 kind: NetworkPolicy
 metadata:
+  name: allow-metrics-traffic
+  namespace: system
   labels:
     app.kubernetes.io/name: kubewol
     app.kubernetes.io/managed-by: kustomize
-  name: allow-metrics-traffic
-  namespace: system
 spec:
   podSelector:
     matchLabels:
@@ -17,11 +24,10 @@ spec:
   policyTypes:
     - Ingress
   ingress:
-    # This allows ingress traffic from any namespace with the label metrics: enabled
     - from:
-      - namespaceSelector:
-          matchLabels:
-            metrics: enabled  # Only from namespaces with this label
+        - namespaceSelector:
+            matchLabels:
+              kubewol-metrics: scraper
       ports:
-        - port: 8443
+        - port: 9090
           protocol: TCP
