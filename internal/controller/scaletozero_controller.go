@@ -39,15 +39,15 @@ const (
 
 // WatchEntry tracks BPF state for one Service.
 type WatchEntry struct {
-	Namespace    string
-	Service      string
-	Deployment   string
-	ClusterIP    net.IP
-	Port         uint16
-	NodePort     int32
-	BPFKey       bpf.SvcKey
-	ProxyMode    bool
-	ReadySince   time.Time // when endpoints first became ready (zero = not ready)
+	Namespace  string
+	Service    string
+	Deployment string
+	ClusterIP  net.IP
+	Port       uint16
+	NodePort   int32
+	BPFKey     bpf.SvcKey
+	ProxyMode  bool
+	ReadySince time.Time // when endpoints first became ready (zero = not ready)
 }
 
 // ScaleToZeroReconciler reconciles Services annotated with kubewol/enabled=true.

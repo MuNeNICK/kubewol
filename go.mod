@@ -1,6 +1,6 @@
 module github.com/munenick/kubewol
 
-go 1.24.5
+go 1.26.1
 
 require (
 	github.com/cilium/ebpf v0.21.0

@@ -55,4 +55,4 @@ func (r *ringbufReader) ReadEvent() (synEventLog, error) {
 	}, nil
 }
 
-func (r *ringbufReader) Close() { r.rd.Close() }
+func (r *ringbufReader) Close() { _ = r.rd.Close() }

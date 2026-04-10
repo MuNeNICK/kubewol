@@ -99,7 +99,7 @@ func (m *Manager) attachAll() error {
 // Close detaches all programs and closes the collection.
 func (m *Manager) Close() {
 	for _, l := range m.links {
-		l.Close()
+		_ = l.Close()
 	}
 	m.coll.Close()
 }
@@ -122,8 +122,8 @@ func (m *Manager) AddWatch(clusterIP net.IP, port uint16, nodePort int32) (SvcKe
 	}
 	if nodePort > 0 {
 		npKey := uint32(Htons(uint16(nodePort)))
-		m.coll.Maps["nodeport_mode"].Update(npKey, val, ebpf.UpdateAny)
-		m.coll.Maps["nodeport_to_svc"].Update(npKey, key, ebpf.UpdateAny)
+		_ = m.coll.Maps["nodeport_mode"].Update(npKey, val, ebpf.UpdateAny)
+		_ = m.coll.Maps["nodeport_to_svc"].Update(npKey, key, ebpf.UpdateAny)
 	}
 	return key, nil
 }
@@ -134,15 +134,15 @@ func (m *Manager) RemoveWatch(clusterIP net.IP, port uint16, nodePort int32) {
 	defer m.mu.Unlock()
 
 	key := SvcKey{Addr: IPToUint32(clusterIP), Port: Htons(port)}
-	m.coll.Maps["watch_svc"].Delete(key)
-	m.coll.Maps["syn_count"].Delete(key)
-	m.coll.Maps["proxy_mode"].Delete(key)
-	m.coll.Maps["rst_suppress"].Delete(key)
+	_ = m.coll.Maps["watch_svc"].Delete(key)
+	_ = m.coll.Maps["syn_count"].Delete(key)
+	_ = m.coll.Maps["proxy_mode"].Delete(key)
+	_ = m.coll.Maps["rst_suppress"].Delete(key)
 	if nodePort > 0 {
 		npKey := uint32(Htons(uint16(nodePort)))
-		m.coll.Maps["nodeport_mode"].Delete(npKey)
-		m.coll.Maps["nodeport_rst_suppress"].Delete(npKey)
-		m.coll.Maps["nodeport_to_svc"].Delete(npKey)
+		_ = m.coll.Maps["nodeport_mode"].Delete(npKey)
+		_ = m.coll.Maps["nodeport_rst_suppress"].Delete(npKey)
+		_ = m.coll.Maps["nodeport_to_svc"].Delete(npKey)
 	}
 }
 
@@ -155,10 +155,10 @@ func (m *Manager) SetProxyMode(key SvcKey, enabled bool, nodePort int32) {
 	if enabled {
 		val = 1
 	}
-	m.coll.Maps["proxy_mode"].Update(key, val, ebpf.UpdateAny)
+	_ = m.coll.Maps["proxy_mode"].Update(key, val, ebpf.UpdateAny)
 	if nodePort > 0 {
 		npKey := uint32(Htons(uint16(nodePort)))
-		m.coll.Maps["nodeport_mode"].Update(npKey, val, ebpf.UpdateAny)
+		_ = m.coll.Maps["nodeport_mode"].Update(npKey, val, ebpf.UpdateAny)
 	}
 }
 
@@ -172,10 +172,10 @@ func (m *Manager) SetRstSuppress(key SvcKey, enabled bool, nodePort int32) {
 	if enabled {
 		val = 1
 	}
-	m.coll.Maps["rst_suppress"].Update(key, val, ebpf.UpdateAny)
+	_ = m.coll.Maps["rst_suppress"].Update(key, val, ebpf.UpdateAny)
 	if nodePort > 0 {
 		npKey := uint32(Htons(uint16(nodePort)))
-		m.coll.Maps["nodeport_rst_suppress"].Update(npKey, val, ebpf.UpdateAny)
+		_ = m.coll.Maps["nodeport_rst_suppress"].Update(npKey, val, ebpf.UpdateAny)
 	}
 }
 
