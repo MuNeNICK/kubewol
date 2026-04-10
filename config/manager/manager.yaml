@@ -25,6 +25,9 @@ spec:
     metadata:
       annotations:
         kubectl.kubernetes.io/default-container: manager
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "9090"
+        prometheus.io/path: "/metrics"
       labels:
         control-plane: controller-manager
         app.kubernetes.io/name: kubewol
@@ -38,13 +41,15 @@ spec:
             - /manager
           args:
             - --health-probe-bind-address=:8081
-            - --external-metrics-addr=:6443
+            - --metrics-bind-address=:9090
+            # - --remote-write-url=http://prometheus-server.monitoring.svc:80/api/v1/write
           image: controller:latest
           imagePullPolicy: IfNotPresent
           name: manager
           ports:
-            - containerPort: 6443
-              name: metrics-api
+            - containerPort: 9090
+              name: metrics
+              hostPort: 9090
             - containerPort: 8081
               name: healthz
           securityContext:

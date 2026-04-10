@@ -27,12 +27,12 @@ import (
 )
 
 const (
-	// AnnotationEnabled marks a Service for eBPF scale-to-zero monitoring.
-	//   kubectl annotate svc demo-app kubewol/enabled=true
+	// AnnotationEnabled marks a Service for kubewol monitoring.
+	//   kubectl annotate svc my-app kubewol/enabled=true
 	AnnotationEnabled = "kubewol/enabled"
 
 	// AnnotationDeployment overrides the Deployment name (default: same as Service name).
-	//   kubectl annotate svc demo-app kubewol/deployment=my-deploy
+	//   kubectl annotate svc my-app kubewol/deployment=my-deploy
 	AnnotationDeployment = "kubewol/deployment"
 )
 
@@ -53,28 +53,23 @@ type ScaleToZeroReconciler struct {
 	client.Client
 	Scheme *runtime.Scheme
 	BPF    *bpf.Manager
-	Snap   *metrics.Snapshotter
 
 	mu      sync.RWMutex
-	watches map[types.NamespacedName]*WatchEntry // svc ns/name -> entry
+	watches map[types.NamespacedName]*WatchEntry
 }
 
 // +kubebuilder:rbac:groups="",resources=services,verbs=get;list;watch
 // +kubebuilder:rbac:groups=discovery.k8s.io,resources=endpointslices,verbs=list;watch
-// +kubebuilder:rbac:groups="",resources=pods,verbs=list
 
-// Reconcile handles Service create/update/delete.
 func (r *ScaleToZeroReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
 	logger := log.FromContext(ctx)
 
 	var svc corev1.Service
 	if err := r.Get(ctx, req.NamespacedName, &svc); err != nil {
-		// Service deleted -> remove from BPF
 		r.removeWatch(req.NamespacedName)
 		return ctrl.Result{}, client.IgnoreNotFound(err)
 	}
 
-	// Check annotation
 	if svc.Annotations[AnnotationEnabled] != "true" {
 		r.removeWatch(req.NamespacedName)
 		return ctrl.Result{}, nil
@@ -156,21 +151,10 @@ func (r *ScaleToZeroReconciler) countReadyEndpoints(ctx context.Context, ns, svc
 	return n
 }
 
-// RecordSnapshot captures BPF SYN counts for windowed metrics.
-func (r *ScaleToZeroReconciler) RecordSnapshot() {
-	r.mu.RLock()
-	defer r.mu.RUnlock()
-	counts := make(map[string]uint64)
-	for _, e := range r.watches {
-		counts[e.Namespace+"/"+e.Service] += r.BPF.ReadSynCount(e.BPFKey)
-	}
-	r.Snap.Record(counts)
-}
-
-// MetricsProvider returns the Provider for the External Metrics API.
+// MetricsProvider returns the Provider for the Prometheus exporter.
+// Returns cumulative BPF SYN counts. Prometheus computes rate()/increase().
 func (r *ScaleToZeroReconciler) MetricsProvider() metrics.Provider {
 	return func() []metrics.ServiceMetric {
-		windowed := r.Snap.Windowed()
 		r.mu.RLock()
 		defer r.mu.RUnlock()
 		seen := map[string]bool{}
@@ -181,12 +165,10 @@ func (r *ScaleToZeroReconciler) MetricsProvider() metrics.Provider {
 				continue
 			}
 			seen[k] = true
-			var c uint64
-			if windowed != nil {
-				c = windowed[k]
-			}
 			out = append(out, metrics.ServiceMetric{
-				Namespace: e.Namespace, Service: e.Service, Count: c,
+				Namespace: e.Namespace,
+				Service:   e.Service,
+				Count:     r.BPF.ReadSynCount(e.BPFKey),
 			})
 		}
 		return out

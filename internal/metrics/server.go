@@ -1,205 +1,188 @@
-// Package metrics serves the External Metrics API backed by BPF map data.
+// Package metrics provides a Prometheus exporter and Remote Write pusher
+// for eBPF SYN count metrics.
 package metrics
 
 import (
-	"crypto/ecdsa"
-	"crypto/elliptic"
-	"crypto/rand"
-	"crypto/tls"
-	"crypto/x509"
-	"crypto/x509/pkix"
-	"encoding/json"
-	"encoding/pem"
+	"bytes"
+	"encoding/binary"
 	"fmt"
-	"math/big"
+	"io"
+	"math"
 	"net/http"
-	"strings"
 	"sync"
 	"time"
+
+	"github.com/golang/snappy"
+	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/promhttp"
 )
 
-// ServiceMetric holds the windowed SYN count for one service.
+// ServiceMetric holds the current SYN count for a service.
 type ServiceMetric struct {
 	Namespace string
 	Service   string
 	Count     uint64
 }
 
-// Provider is called to get the current windowed metrics.
+// Provider is called to get current metrics.
 type Provider func() []ServiceMetric
 
-// Server serves the external.metrics.k8s.io API.
-type Server struct {
-	provider Provider
-	mux      *http.ServeMux
+// Exporter exposes Prometheus /metrics and pushes via Remote Write on demand.
+type Exporter struct {
+	provider       Provider
+	remoteWriteURL string
+	desc           *prometheus.Desc
+	pushMu         sync.Mutex
 }
 
-// NewServer creates an External Metrics API server.
-func NewServer(provider Provider) *Server {
-	s := &Server{provider: provider}
-	s.mux = http.NewServeMux()
-	s.mux.HandleFunc("/apis/external.metrics.k8s.io/v1beta1", s.discoveryHandler)
-	s.mux.HandleFunc("/apis/external.metrics.k8s.io/v1beta1/", s.metricsHandler)
-	s.mux.HandleFunc("/apis", s.apiGroupsHandler)
-	return s
-}
-
-// ListenAndServeTLS starts the HTTPS server with a self-signed cert.
-func (s *Server) ListenAndServeTLS(addr string) error {
-	tlsCfg, err := selfSignedTLS()
-	if err != nil {
-		return fmt.Errorf("tls: %w", err)
-	}
-	srv := &http.Server{Addr: addr, Handler: s.mux, TLSConfig: tlsCfg}
-	return srv.ListenAndServeTLS("", "")
-}
-
-func (s *Server) metricsHandler(w http.ResponseWriter, r *http.Request) {
-	parts := strings.Split(strings.TrimPrefix(r.URL.Path, "/apis/external.metrics.k8s.io/v1beta1/"), "/")
-	if len(parts) < 3 || parts[0] != "namespaces" {
-		http.Error(w, "not found", 404)
-		return
-	}
-	ns := parts[1]
-	metricName := parts[2]
-	if metricName != "ebpf_service_syn_total" {
-		http.Error(w, "not found", 404)
-		return
-	}
-
-	now := time.Now().UTC().Format(time.RFC3339)
-	items := []map[string]any{}
-
-	for _, m := range s.provider() {
-		if m.Namespace != ns {
-			continue
-		}
-		items = append(items, map[string]any{
-			"metricName":   metricName,
-			"metricLabels": map[string]string{"service": m.Service},
-			"timestamp":    now,
-			"value":        fmt.Sprintf("%d", m.Count),
-		})
-	}
-
-	resp := map[string]any{
-		"kind":       "ExternalMetricValueList",
-		"apiVersion": "external.metrics.k8s.io/v1beta1",
-		"metadata":   map[string]any{},
-		"items":      items,
-	}
-	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(resp)
-}
-
-func (s *Server) discoveryHandler(w http.ResponseWriter, r *http.Request) {
-	resp := map[string]any{
-		"kind":         "APIResourceList",
-		"apiVersion":   "v1",
-		"groupVersion": "external.metrics.k8s.io/v1beta1",
-		"resources": []map[string]any{{
-			"name": "externalmetrics", "namespaced": true,
-			"kind": "ExternalMetricValueList", "verbs": []string{"get"},
-		}},
-	}
-	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(resp)
-}
-
-func (s *Server) apiGroupsHandler(w http.ResponseWriter, r *http.Request) {
-	resp := map[string]any{
-		"kind": "APIGroupList", "apiVersion": "v1",
-		"groups": []map[string]any{{
-			"name": "external.metrics.k8s.io",
-			"versions": []map[string]string{
-				{"groupVersion": "external.metrics.k8s.io/v1beta1", "version": "v1beta1"},
-			},
-			"preferredVersion": map[string]string{
-				"groupVersion": "external.metrics.k8s.io/v1beta1", "version": "v1beta1",
-			},
-		}},
-	}
-	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(resp)
-}
-
-func selfSignedTLS() (*tls.Config, error) {
-	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
-	if err != nil {
-		return nil, err
-	}
-	tmpl := &x509.Certificate{
-		SerialNumber: big.NewInt(1),
-		Subject:      pkix.Name{CommonName: "kubewol"},
-		NotBefore:    time.Now(),
-		NotAfter:     time.Now().Add(10 * 365 * 24 * time.Hour),
-		KeyUsage:     x509.KeyUsageDigitalSignature,
-		ExtKeyUsage:  []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
-		DNSNames:     []string{"ebpf-monitor-api.monitoring.svc"},
-	}
-	certDER, err := x509.CreateCertificate(rand.Reader, tmpl, tmpl, &key.PublicKey, key)
-	if err != nil {
-		return nil, err
-	}
-	certPEM := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: certDER})
-	keyDER, _ := x509.MarshalECPrivateKey(key)
-	keyPEM := pem.EncodeToMemory(&pem.Block{Type: "EC PRIVATE KEY", Bytes: keyDER})
-	cert, err := tls.X509KeyPair(certPEM, keyPEM)
-	if err != nil {
-		return nil, err
-	}
-	return &tls.Config{Certificates: []tls.Certificate{cert}}, nil
-}
-
-// Snapshotter computes windowed SYN counts from periodic cumulative snapshots.
-type Snapshotter struct {
-	mu     sync.RWMutex
-	snaps  []snap
-	window time.Duration
-	maxN   int
-}
-
-type snap struct {
-	ts     time.Time
-	counts map[string]uint64
-}
-
-func NewSnapshotter(window time.Duration, interval time.Duration) *Snapshotter {
-	n := int(window/interval) + 1
-	if n < 2 {
-		n = 2
-	}
-	return &Snapshotter{window: window, maxN: n}
-}
-
-// Record stores a new snapshot.
-func (s *Snapshotter) Record(counts map[string]uint64) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	s.snaps = append(s.snaps, snap{ts: time.Now(), counts: counts})
-	if len(s.snaps) > s.maxN {
-		s.snaps = s.snaps[len(s.snaps)-s.maxN:]
+// NewExporter creates a Prometheus exporter.
+// remoteWriteURL can be empty to disable Remote Write push.
+func NewExporter(provider Provider, remoteWriteURL string) *Exporter {
+	return &Exporter{
+		provider:       provider,
+		remoteWriteURL: remoteWriteURL,
+		desc: prometheus.NewDesc(
+			"ebpf_service_syn_total",
+			"TCP SYN packets observed by eBPF for a Kubernetes service",
+			[]string{"namespace", "service"}, nil,
+		),
 	}
 }
 
-// Windowed returns the SYN increase per service key over the window.
-func (s *Snapshotter) Windowed() map[string]uint64 {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-	if len(s.snaps) < 2 {
-		if len(s.snaps) == 1 {
-			return s.snaps[0].counts
-		}
+// Describe implements prometheus.Collector.
+func (e *Exporter) Describe(ch chan<- *prometheus.Desc) {
+	ch <- e.desc
+}
+
+// Collect implements prometheus.Collector.
+func (e *Exporter) Collect(ch chan<- prometheus.Metric) {
+	for _, m := range e.provider() {
+		ch <- prometheus.MustNewConstMetric(
+			e.desc, prometheus.CounterValue, float64(m.Count),
+			m.Namespace, m.Service,
+		)
+	}
+}
+
+// Handler returns the Prometheus HTTP handler.
+func (e *Exporter) Handler() http.Handler {
+	reg := prometheus.NewRegistry()
+	reg.MustRegister(e)
+	return promhttp.HandlerFor(reg, promhttp.HandlerOpts{})
+}
+
+// PushRemoteWrite sends current metrics to Prometheus via Remote Write.
+// Call on SYN detection for fast metric delivery (bypasses scrape interval).
+func (e *Exporter) PushRemoteWrite() error {
+	if e.remoteWriteURL == "" {
 		return nil
 	}
-	newest := s.snaps[len(s.snaps)-1]
-	oldest := s.snaps[0]
-	result := make(map[string]uint64)
-	for k, cur := range newest.counts {
-		prev := oldest.counts[k]
-		if cur > prev {
-			result[k] = cur - prev
-		}
+	e.pushMu.Lock()
+	defer e.pushMu.Unlock()
+
+	metrics := e.provider()
+	if len(metrics) == 0 {
+		return nil
 	}
-	return result
+
+	now := time.Now().UnixMilli()
+	data := encodeWriteRequest(metrics, now)
+	compressed := snappy.Encode(nil, data)
+
+	req, err := http.NewRequest("POST", e.remoteWriteURL, bytes.NewReader(compressed))
+	if err != nil {
+		return fmt.Errorf("new request: %w", err)
+	}
+	req.Header.Set("Content-Type", "application/x-protobuf")
+	req.Header.Set("Content-Encoding", "snappy")
+	req.Header.Set("X-Prometheus-Remote-Write-Version", "0.1.0")
+
+	resp, err := (&http.Client{Timeout: 5 * time.Second}).Do(req)
+	if err != nil {
+		return fmt.Errorf("remote write: %w", err)
+	}
+	defer resp.Body.Close()
+	io.Copy(io.Discard, resp.Body)
+
+	if resp.StatusCode/100 != 2 {
+		return fmt.Errorf("remote write: status %d", resp.StatusCode)
+	}
+	return nil
+}
+
+// ── Minimal protobuf encoder for Prometheus Remote Write ──
+//
+// WriteRequest { repeated TimeSeries timeseries = 1 }
+// TimeSeries   { repeated Label labels = 1; repeated Sample samples = 2 }
+// Label        { string name = 1; string value = 2 }
+// Sample       { double value = 1; int64 timestamp = 2 }
+
+func encodeWriteRequest(metrics []ServiceMetric, timestampMs int64) []byte {
+	var buf bytes.Buffer
+	for _, m := range metrics {
+		ts := encodeTimeSeries(m, timestampMs)
+		writeTag(&buf, 1, 2) // field 1, wire type 2 (length-delimited)
+		writeBytes(&buf, ts)
+	}
+	return buf.Bytes()
+}
+
+func encodeTimeSeries(m ServiceMetric, ts int64) []byte {
+	var buf bytes.Buffer
+	// labels
+	for _, lbl := range [][2]string{
+		{"__name__", "ebpf_service_syn_total"},
+		{"namespace", m.Namespace},
+		{"service", m.Service},
+	} {
+		l := encodeLabel(lbl[0], lbl[1])
+		writeTag(&buf, 1, 2)
+		writeBytes(&buf, l)
+	}
+	// sample
+	s := encodeSample(float64(m.Count), ts)
+	writeTag(&buf, 2, 2)
+	writeBytes(&buf, s)
+	return buf.Bytes()
+}
+
+func encodeLabel(name, value string) []byte {
+	var buf bytes.Buffer
+	writeTag(&buf, 1, 2)
+	writeBytes(&buf, []byte(name))
+	writeTag(&buf, 2, 2)
+	writeBytes(&buf, []byte(value))
+	return buf.Bytes()
+}
+
+func encodeSample(value float64, timestampMs int64) []byte {
+	var buf bytes.Buffer
+	// double value = 1 (wire type 1 = fixed 64-bit)
+	writeTag(&buf, 1, 1)
+	b := make([]byte, 8)
+	binary.LittleEndian.PutUint64(b, math.Float64bits(value))
+	buf.Write(b)
+	// int64 timestamp = 2 (wire type 0 = varint)
+	writeTag(&buf, 2, 0)
+	writeVarint(&buf, timestampMs)
+	return buf.Bytes()
+}
+
+func writeTag(buf *bytes.Buffer, field int, wireType int) {
+	writeUvarint(buf, uint64(field<<3|wireType))
+}
+
+func writeBytes(buf *bytes.Buffer, data []byte) {
+	writeUvarint(buf, uint64(len(data)))
+	buf.Write(data)
+}
+
+func writeVarint(buf *bytes.Buffer, v int64) {
+	writeUvarint(buf, uint64(v))
+}
+
+func writeUvarint(buf *bytes.Buffer, v uint64) {
+	var b [10]byte
+	n := binary.PutUvarint(b[:], v)
+	buf.Write(b[:n])
 }

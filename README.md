@@ -2,28 +2,29 @@
 
 Wake-on-LAN for Kubernetes. eBPF detects TCP SYN and wakes scaled-to-zero workloads.
 
-kubewol enables true scale-to-zero for Kubernetes workloads by combining eBPF traffic observation with the [HPA `HPAScaleToZero` feature gate](https://kubernetes.io/docs/reference/command-line-tools-reference/feature-gates/) (Alpha since v1.16, [improved in v1.36](https://github.com/kubernetes/kubernetes/pull/135118)).
+kubewol is an eBPF-based traffic sensor and Prometheus exporter that enables HPA scale-to-zero with TCP connection preservation. It requires the [HPA `HPAScaleToZero` feature gate](https://kubernetes.io/docs/reference/command-line-tools-reference/feature-gates/) (Alpha since v1.16, [improved in v1.36 with `ScaledToZero` condition](https://github.com/kubernetes/kubernetes/pull/135118)).
 
 ## How it works
 
 ```
 Client ── SYN ──> [ TC ingress: eBPF ] ── SYN DROP (no conntrack pollution)
                          |
-                   SYN count -> External Metrics API -> HPA scales 0->N
+                   SYN count -> Prometheus -> Prometheus Adapter -> HPA scales 0->N
                          |
                    [ TC egress: eBPF ] ── RST/ICMP suppression (fallback)
                          |
-          Pod Ready -> proxy_mode OFF -> SYN passes through -> connection established
+          Pod Ready -> proxy_mode OFF -> SYN retransmit passes through -> connection established
 ```
 
 - **No proxy, no sidecar.** Request path is unchanged: `Client -> Service -> Pod`.
-- **No Prometheus required.** kubewol serves the External Metrics API directly from BPF maps.
-- **TCP connection is preserved.** SYN is silently dropped (not rejected), so the client's TCP stack retransmits. Once the Pod is ready, the retransmit succeeds on the same socket.
+- **Prometheus native.** Standard /metrics exporter + optional Remote Write for fast cold start. No APIService conflict with other metrics providers.
+- **TCP connection preserved.** SYN is silently dropped (not rejected), so the client's TCP stack retransmits. Once the Pod is ready, the retransmit succeeds on the same socket.
 
 ## Prerequisites
 
-- Kubernetes **v1.36+** with `HPAScaleToZero=true` feature gate enabled
+- Kubernetes **v1.36+** with `HPAScaleToZero=true` feature gate enabled ([docs](https://kubernetes.io/docs/reference/command-line-tools-reference/feature-gates/))
 - Linux kernel **6.6+** (for TCX BPF link support)
+- **Prometheus** + **Prometheus Adapter** (for HPA external metrics)
 
 ## Install
 
@@ -59,7 +60,24 @@ Optional: if the Deployment name differs from the Service name:
 kubectl annotate svc my-app kubewol/deployment=my-deploy
 ```
 
-### 2. Create an HPA with `minReplicas: 0`
+### 2. Configure Prometheus Adapter
+
+Add a rule for `ebpf_service_syn_total` to your Prometheus Adapter config:
+
+```yaml
+rules:
+  external:
+    - seriesQuery: 'ebpf_service_syn_total'
+      resources:
+        overrides:
+          namespace: {resource: "namespace"}
+      name:
+        matches: "^(.*)$"
+        as: "${1}"
+      metricsQuery: 'sum(increase(<<.Series>>{<<.LabelMatchers>>}[2m]))'
+```
+
+### 3. Create an HPA with `minReplicas: 0`
 
 ```yaml
 apiVersion: autoscaling/v2
@@ -100,15 +118,17 @@ spec:
           periodSeconds: 15
 ```
 
-> **Important:** The `scaleUp` section must include a `Pods` type policy. A `Percent`-only policy cannot scale from 0 (100% of 0 = 0).
+> **Important:** `scaleUp` must include a `Pods` type policy. `Percent`-only cannot scale from 0 (100% of 0 = 0).
 
-### 3. Done
+### 4. Done
 
 When no traffic arrives, HPA scales the Deployment to 0. When a TCP SYN is detected:
 
-1. kubewol counts it and exposes via External Metrics API
-2. HPA sees `ebpf_service_syn_total > 0` and scales up
-3. The client's TCP connection is preserved through SYN retransmit
+1. kubewol counts it and exposes via Prometheus `/metrics`
+2. Prometheus scrapes it (or kubewol pushes via Remote Write for speed)
+3. Prometheus Adapter exposes as external metric
+4. HPA sees `ebpf_service_syn_total > 0` and scales up
+5. The client's TCP connection is preserved through SYN retransmit
 
 ## Annotations
 
@@ -117,29 +137,61 @@ When no traffic arrives, HPA scales the Deployment to 0. When a TCP SYN is detec
 | `kubewol/enabled` | Yes | - | Set to `"true"` to enable monitoring |
 | `kubewol/deployment` | No | Service name | Deployment name if different from Service |
 
+## Flags
+
+| Flag | Default | Description |
+|---|---|---|
+| `--metrics-bind-address` | `:9090` | Prometheus /metrics bind address |
+| `--health-probe-bind-address` | `:8081` | Health probe bind address |
+| `--remote-write-url` | (disabled) | Prometheus Remote Write URL for fast cold start push (e.g. `http://prometheus:9090/api/v1/write`) |
+
+## Fast cold start with Remote Write
+
+By default, kubewol relies on Prometheus scraping `/metrics`. The cold start latency depends on the scrape interval (typically 15-60s).
+
+To reduce cold start to ~25s, enable [Prometheus Remote Write receiver](https://prometheus.io/docs/prometheus/latest/configuration/configuration/#remote_write_receiver) and pass the URL:
+
+```yaml
+# In DaemonSet args:
+- --remote-write-url=http://prometheus-server.monitoring.svc:80/api/v1/write
+```
+
+When a SYN is detected for a scaled-to-zero service, kubewol immediately pushes the metric, bypassing the scrape interval.
+
 ## Architecture
 
 ```
-kubewol DaemonSet (one per node)
+kubewol DaemonSet (one per node, read-only RBAC)
   |
   +-- TC ingress (eBPF)
-  |     SYN counting
-  |     SYN DROP when no endpoints (preserves TCP connection)
+  |     SYN counting + SYN DROP when no endpoints
   |
   +-- TC egress (eBPF)
   |     RST/ICMP suppression (race condition fallback)
   |
   +-- controller-runtime Reconciler
-  |     Watches: Service (annotation), EndpointSlice (proxy_mode)
+  |     Watches: Service (annotation), EndpointSlice (proxy_mode toggle)
   |
-  +-- External Metrics API server (:6443)
-        BPF map -> windowed SYN count -> HPA
+  +-- Prometheus exporter (:9090/metrics)
+  |     ebpf_service_syn_total counter from BPF map
+  |
+  +-- Remote Write push (optional)
+        On SYN detection -> POST to Prometheus /api/v1/write
+
+External (not part of kubewol):
+  Prometheus -> Prometheus Adapter -> HPA
 ```
 
 ## Uninstall
 
 ```bash
 kubectl delete -f https://github.com/munenick/kubewol/releases/latest/download/install.yaml
+```
+
+Remove annotations from services:
+
+```bash
+kubectl annotate svc my-app kubewol/enabled-
 ```
 
 ## License
