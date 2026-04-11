@@ -293,7 +293,12 @@ func runAgent(probeAddr, metricsAddr, remoteWriteURL, ifaceAllow, ifaceDeny stri
 // Controller entry point
 // ─────────────────────────────────────────
 
-func runController(probeAddr, metricsAddr, agentNamespace, agentService string, agentPort int, tls controller.FleetOptions) {
+func runController(
+	probeAddr, metricsAddr string,
+	agentNamespace, agentService string,
+	agentPort int,
+	tls controller.FleetOptions,
+) {
 	mgr, err := ctrl.NewManager(ctrl.GetConfigOrDie(), ctrl.Options{
 		Scheme: scheme,
 		Metrics: metricsserver.Options{

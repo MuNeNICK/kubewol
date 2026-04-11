@@ -406,7 +406,11 @@ func (a *Agent) emit(evt SynEvent) {
 // logical target via lookupByBPFKey, and emits a SynEvent for any match
 // that opted into direct-scale.
 func (a *Agent) RunRingBufReader(ctx context.Context, reader SynEventReader) {
-	defer reader.Close()
+	defer func() {
+		if err := reader.Close(); err != nil {
+			a.logger.V(1).Info("ring buffer reader close failed", "error", err.Error())
+		}
+	}()
 	for {
 		select {
 		case <-ctx.Done():

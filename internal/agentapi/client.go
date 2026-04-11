@@ -27,7 +27,6 @@ import (
 	"fmt"
 	"os"
 	"strings"
-	"sync"
 	"time"
 
 	"google.golang.org/grpc"
@@ -64,9 +63,6 @@ type Client struct {
 	conn      *grpc.ClientConn
 	pb        pb.AgentClient
 	tokenPath string
-
-	mu    sync.Mutex
-	token string
 }
 
 // NewClient dials the given target (host:port) and returns a Client. The
