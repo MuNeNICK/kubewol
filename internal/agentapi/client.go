@@ -5,22 +5,25 @@
 // bearer token per RPC.
 //
 // Authentication model:
-//   - Transport: TLS with InsecureSkipVerify. The agent presents a
-//     self-signed certificate generated in-memory at startup; verifying it
-//     would require cert-manager or an equivalent CA bootstrap that kubewol
-//     deliberately avoids. Residual MITM risk is mitigated by:
-//       1. pod-network scoping via NetworkPolicy,
-//       2. the audience-bound bearer token below.
+//   - Transport: TLS. If ClientOptions.CAFile is set the controller verifies
+//     the agent's certificate against that CA bundle. Otherwise the client
+//     falls back to InsecureSkipVerify because the agent mints a self-signed
+//     cert in-memory at startup; this matches controller-runtime's metrics
+//     server default. Operators who want full peer verification distribute
+//     a shared CA (for example via cert-manager) and point --agent-tls-ca-file
+//     at the mounted bundle.
 //   - Bearer token: a projected ServiceAccount token with
 //     audience=kubewol.io/agent-api. The agent's gRPC auth interceptor
 //     validates it via TokenReview with spec.audiences set, so a leaked
 //     token cannot be replayed against kube-apiserver or any other
-//     audience-unchecked in-cluster service.
+//     audience-unchecked in-cluster service. This is the primary defence;
+//     TLS verification above is defence-in-depth.
 package agentapi
 
 import (
 	"context"
 	"crypto/tls"
+	"crypto/x509"
 	"fmt"
 	"os"
 	"strings"
@@ -38,9 +41,20 @@ import (
 // ServiceAccount token.
 const DefaultAudienceTokenPath = "/var/run/secrets/kubewol/agent-api/token"
 
-// FallbackTokenPath is the default ServiceAccount volume path. Used for
-// graceful degradation and unit tests.
-const FallbackTokenPath = "/var/run/secrets/kubernetes.io/serviceaccount/token"
+// ClientOptions configures TLS + token sourcing for a Client. An empty
+// struct selects kubewol defaults: InsecureSkipVerify + the audience-bound
+// token at DefaultAudienceTokenPath.
+type ClientOptions struct {
+	// TokenPath overrides the bearer token file. Empty means use
+	// DefaultAudienceTokenPath.
+	TokenPath string
+	// CAFile is the path to a PEM-encoded CA bundle the client uses to
+	// verify the agent certificate. Empty means InsecureSkipVerify.
+	CAFile string
+	// ServerName is the SNI / X.509 hostname the agent cert must present.
+	// Ignored when CAFile is empty.
+	ServerName string
+}
 
 // Client wraps a grpc.ClientConn and the audience-bound token file, handing
 // back a pb.AgentClient that automatically attaches the bearer token to
@@ -57,13 +71,19 @@ type Client struct {
 
 // NewClient dials the given target (host:port) and returns a Client. The
 // target is passed to grpc.NewClient directly; scheme is implicit.
+// tokenPath is a legacy-friendly shorthand; prefer NewClientWithOptions for
+// new call sites that need TLS verification.
 func NewClient(target, tokenPath string) (*Client, error) {
+	return NewClientWithOptions(target, ClientOptions{TokenPath: tokenPath})
+}
+
+// NewClientWithOptions is the full-fat constructor. If CAFile is set the
+// client verifies the agent certificate against that bundle; otherwise it
+// falls back to InsecureSkipVerify as documented at the package level.
+func NewClientWithOptions(target string, opts ClientOptions) (*Client, error) {
+	tokenPath := opts.TokenPath
 	if tokenPath == "" {
-		if _, err := os.Stat(DefaultAudienceTokenPath); err == nil {
-			tokenPath = DefaultAudienceTokenPath
-		} else {
-			tokenPath = FallbackTokenPath
-		}
+		tokenPath = DefaultAudienceTokenPath
 	}
 	// Verify the file is readable up-front so misconfiguration fails fast.
 	if _, err := os.ReadFile(tokenPath); err != nil {
@@ -71,9 +91,24 @@ func NewClient(target, tokenPath string) (*Client, error) {
 	}
 
 	tlsCfg := &tls.Config{
-		InsecureSkipVerify: true, // self-signed agent cert; see package doc.
-		MinVersion:         tls.VersionTLS12,
+		MinVersion: tls.VersionTLS12,
 	}
+	if opts.CAFile != "" {
+		caPEM, err := os.ReadFile(opts.CAFile)
+		if err != nil {
+			return nil, fmt.Errorf("read CA bundle %s: %w", opts.CAFile, err)
+		}
+		pool := x509.NewCertPool()
+		if !pool.AppendCertsFromPEM(caPEM) {
+			return nil, fmt.Errorf("CA bundle %s: no PEM certificates", opts.CAFile)
+		}
+		tlsCfg.RootCAs = pool
+		tlsCfg.ServerName = opts.ServerName
+	} else {
+		// Self-signed agent cert; TokenReview is the primary authorization.
+		tlsCfg.InsecureSkipVerify = true
+	}
+
 	conn, err := grpc.NewClient(target,
 		grpc.WithTransportCredentials(credentials.NewTLS(tlsCfg)),
 		grpc.WithDefaultCallOptions(

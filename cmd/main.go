@@ -9,10 +9,15 @@ package main
 
 import (
 	"context"
+	"errors"
 	"flag"
+	"fmt"
 	"net"
+	"net/http"
 	"os"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"time"
 
 	_ "k8s.io/client-go/plugin/pkg/client/auth"
@@ -58,11 +63,13 @@ func main() {
 	var agentNamespace string
 	var agentService string
 	var agentPort int
+	var agentTLSCAFile string
+	var agentTLSServerName string
 
 	flag.StringVar(&mode, "mode", "agent",
-		"Component to run. 'agent' loads eBPF and serves the agent HTTP API. "+
-			"'controller' runs the reconciler and the direct-scale fast path; "+
-			"it must be able to reach every agent over the pod network.")
+		"Component to run. 'agent' loads eBPF and serves the kubewol.v1.Agent "+
+			"gRPC service. 'controller' runs the reconciler and the direct-scale "+
+			"fast path; it must be able to reach every agent over the pod network.")
 	flag.StringVar(&probeAddr, "health-probe-bind-address", ":8081", "Health probe bind address.")
 	flag.StringVar(&metricsAddr, "metrics-bind-address", ":8443",
 		"HTTPS metrics / agent-API bind address. Served by controller-runtime "+
@@ -83,6 +90,15 @@ func main() {
 	flag.StringVar(&agentGRPCAddr, "agent-grpc-bind-address", ":8444",
 		"Agent-only. gRPC service bind address. Serves the kubewol.v1.Agent "+
 			"service over TLS with audience-bound TokenReview authentication.")
+	flag.StringVar(&agentTLSCAFile, "agent-tls-ca-file", "",
+		"Controller-only. Path to a PEM CA bundle used to verify agent "+
+			"certificates. If empty the controller dials agents with "+
+			"InsecureSkipVerify (audience-bound token remains the primary "+
+			"authentication gate). Populate this when you ship a shared CA, "+
+			"for example via cert-manager.")
+	flag.StringVar(&agentTLSServerName, "agent-tls-server-name", "",
+		"Controller-only. Optional X.509 ServerName the agent certificate "+
+			"must present. Requires --agent-tls-ca-file.")
 
 	opts := zap.Options{Development: true}
 	opts.BindFlags(flag.CommandLine)
@@ -93,7 +109,8 @@ func main() {
 	case "agent":
 		runAgent(probeAddr, metricsAddr, remoteWriteURL, ifaceAllow, ifaceDeny)
 	case "controller":
-		runController(probeAddr, metricsAddr, agentNamespace, agentService, agentPort)
+		runController(probeAddr, metricsAddr, agentNamespace, agentService, agentPort,
+			controller.FleetOptions{CAFile: agentTLSCAFile, ServerName: agentTLSServerName})
 	default:
 		setupLog.Error(nil, "unknown --mode", "mode", mode)
 		os.Exit(1)
@@ -151,11 +168,23 @@ func runAgent(probeAddr, metricsAddr, remoteWriteURL, ifaceAllow, ifaceDeny stri
 		os.Exit(1)
 	}
 
+	// readyzDown is set to the first fatal error observed by a background
+	// goroutine (ring buffer reader, gRPC server). Once flipped, the
+	// readyz probe starts returning that error so Kubernetes pulls the
+	// pod out of the Service endpoints and its kubelet restarts it.
+	// healthz stays healthy so the kubelet does not miss the transition.
+	var readyzDown atomic.Pointer[error]
+
 	if err := mgr.AddHealthzCheck("healthz", healthz.Ping); err != nil {
 		setupLog.Error(err, "unable to set up health check")
 		os.Exit(1)
 	}
-	if err := mgr.AddReadyzCheck("readyz", healthz.Ping); err != nil {
+	if err := mgr.AddReadyzCheck("readyz", func(_ *http.Request) error {
+		if p := readyzDown.Load(); p != nil {
+			return *p
+		}
+		return nil
+	}); err != nil {
 		setupLog.Error(err, "unable to set up ready check")
 		os.Exit(1)
 	}
@@ -169,21 +198,31 @@ func runAgent(probeAddr, metricsAddr, remoteWriteURL, ifaceAllow, ifaceDeny stri
 
 	ctx := ctrl.SetupSignalHandler()
 
+	markDown := func(err error) {
+		// First writer wins.
+		readyzDown.CompareAndSwap(nil, &err)
+		setupLog.Error(err, "agent subsystem terminated; marking readyz unhealthy")
+	}
+
 	// Dynamic TC attach for veth pairs created after startup.
 	go bpfMgr.WatchInterfaces(ctx, time.Second)
 
-	// Ring buffer → gRPC SubscribeSynEvents stream fanout.
+	// Ring buffer → gRPC SubscribeSynEvents stream fanout. Exit of this
+	// goroutine means the direct-scale fast path is dead; flip readyz so
+	// Kubernetes reschedules the pod instead of leaving it running silently.
 	reader, err := newRingbufReader(bpfMgr.SynEventsMap())
 	if err != nil {
 		setupLog.Error(err, "failed to open ringbuf reader")
 		os.Exit(1)
 	}
-	go ag.RunRingBufReader(ctx, reader)
+	go func() {
+		ag.RunRingBufReader(ctx, reader)
+		if ctx.Err() == nil {
+			markDown(errors.New("ring buffer reader exited unexpectedly"))
+		}
+	}()
 
-	// Start the gRPC listener for the agent API on a separate port. It
-	// shares the same audience-bound TokenReview trust boundary as the
-	// metrics server above but has its own TLS certificate (self-signed,
-	// generated in-memory by agent.GenerateSelfSignedTLSConfig).
+	// Start the gRPC listener for the agent API on a separate port.
 	tlsCfg, err := agent.GenerateSelfSignedTLSConfig()
 	if err != nil {
 		setupLog.Error(err, "generate self-signed TLS config")
@@ -197,8 +236,8 @@ func runAgent(probeAddr, metricsAddr, remoteWriteURL, ifaceAllow, ifaceDeny stri
 	}
 	go func() {
 		setupLog.Info("starting agent gRPC server", "addr", agentGRPCAddr)
-		if err := grpcSrv.Serve(grpcListener); err != nil {
-			setupLog.Error(err, "gRPC Serve returned")
+		if err := grpcSrv.Serve(grpcListener); err != nil && ctx.Err() == nil {
+			markDown(fmt.Errorf("gRPC Serve: %w", err))
 		}
 	}()
 	go func() {
@@ -217,7 +256,7 @@ func runAgent(probeAddr, metricsAddr, remoteWriteURL, ifaceAllow, ifaceDeny stri
 // Controller entry point
 // ─────────────────────────────────────────
 
-func runController(probeAddr, metricsAddr, agentNamespace, agentService string, agentPort int) {
+func runController(probeAddr, metricsAddr, agentNamespace, agentService string, agentPort int, tls controller.FleetOptions) {
 	mgr, err := ctrl.NewManager(ctrl.GetConfigOrDie(), ctrl.Options{
 		Scheme: scheme,
 		Metrics: metricsserver.Options{
@@ -233,6 +272,11 @@ func runController(probeAddr, metricsAddr, agentNamespace, agentService string, 
 		os.Exit(1)
 	}
 
+	// Signal handler is set up here so the worker pool's context can be
+	// tied to process shutdown. On SIGTERM the workers observe ctx.Done,
+	// drain outstanding scaleCh sends, and exit cleanly.
+	ctx := ctrl.SetupSignalHandler()
+
 	// Placeholder reconciler: the Fleet is constructed before SetupWithManager
 	// so the reconcile loop has a push target from the very first event. The
 	// direct-scale handler is late-bound because it depends on the reconciler
@@ -243,21 +287,38 @@ func runController(probeAddr, metricsAddr, agentNamespace, agentService string, 
 		Scheme:    mgr.GetScheme(),
 	}
 
-	// Bounded worker pool for direct-scale triggers.
+	// Bounded worker pool for direct-scale triggers. Each worker uses the
+	// signal-handler context so a client-facing ctx cancel (caller of
+	// TriggerScale) cannot abort the scale-subresource write mid-flight,
+	// but process shutdown does stop new retries. The channel is closed on
+	// ctx.Done() in a dedicated goroutine so range-loops unwind cleanly.
 	scaleCh := make(chan scaleJob, 64)
+	var workers sync.WaitGroup
 	for i := 0; i < 4; i++ {
+		workers.Add(1)
 		go func() {
+			defer workers.Done()
 			for job := range scaleCh {
-				reconciler.TriggerScale(context.Background(),
-					job.namespace, job.kind, job.name)
+				reconciler.TriggerScale(ctx, job.namespace, job.kind, job.name)
 			}
 		}()
 	}
-	handleSyn := func(ctx context.Context, evt *pb.SynEvent) {
+	go func() {
+		<-ctx.Done()
+		close(scaleCh)
+	}()
+	handleSyn := func(_ context.Context, evt *pb.SynEvent) {
 		if evt == nil {
 			return
 		}
+		// Use a non-blocking send against the shutdown context so a
+		// late event after close(scaleCh) does not panic.
+		defer func() {
+			_ = recover()
+		}()
 		select {
+		case <-ctx.Done():
+			return
 		case scaleCh <- scaleJob{
 			namespace: evt.GetNamespace(),
 			kind:      evt.GetTargetKind(),
@@ -273,6 +334,7 @@ func runController(probeAddr, metricsAddr, agentNamespace, agentService string, 
 		ctrl.Log.WithName("fleet"),
 		agentNamespace, agentService, agentPort,
 		handleSyn,
+		tls,
 	)
 	reconciler.Fleet = fleet
 
@@ -290,7 +352,6 @@ func runController(probeAddr, metricsAddr, agentNamespace, agentService string, 
 		os.Exit(1)
 	}
 
-	ctx := ctrl.SetupSignalHandler()
 	// Fleet.Run needs the manager's cache so it can subscribe to
 	// EndpointSlice events via the informer already installed by the
 	// reconciler. A small safety ticker inside Run also re-refreshes
@@ -302,6 +363,9 @@ func runController(probeAddr, metricsAddr, agentNamespace, agentService string, 
 		setupLog.Error(err, "problem running manager")
 		os.Exit(1)
 	}
+	// Wait for the scale worker pool to drain before returning so late
+	// TriggerScale calls do not get cut off mid K8s API write.
+	workers.Wait()
 }
 
 // ─────────────────────────────────────────
@@ -352,7 +416,8 @@ func splitPrefixes(csv string) []string {
 	return out
 }
 
-// scaleJob is enqueued to the bounded worker pool on every SSE SYN event.
+// scaleJob is enqueued to the bounded worker pool on every SubscribeSynEvents
+// gRPC message received from any agent.
 type scaleJob struct {
 	namespace string
 	kind      string

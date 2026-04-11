@@ -78,16 +78,28 @@ type Options struct {
 	InterfacePredicate func(iface net.Interface) bool
 }
 
+// attachedIface is the per-interface bookkeeping held by Manager.attached.
+// Tracking the name alongside the ifindex lets attachNewInterfaces detect
+// ifindex reuse (vanished veth → new veth with the same kernel ifindex)
+// and close the stale links before re-attaching.
+type attachedIface struct {
+	name    string
+	ingress link.Link
+	egress  link.Link
+}
+
 // Manager handles eBPF program loading, interface attachment, and map operations.
 type Manager struct {
 	coll      *ebpf.Collection
-	links     []link.Link
 	logger    logr.Logger
 	mu        sync.Mutex
 	predicate func(net.Interface) bool
-	// attached tracks interface index -> nil once both directions are attached.
-	// Used by WatchInterfaces to skip interfaces already covered.
-	attached map[int]struct{}
+	// attached tracks which interfaces currently have both TC programs
+	// attached. Keyed by interface index. The stored value carries the
+	// interface name and the two link handles so the poller in
+	// attachNewInterfaces can detect ifindex reuse (by comparing the
+	// current name against the stored one) and close the stale links.
+	attached map[int]*attachedIface
 
 	// Cached map handles. Set once in NewManager after verifying all required
 	// maps are present. Eliminates nil-pointer panics from map name drift.
@@ -128,7 +140,7 @@ func NewManager(opts Options) (*Manager, error) {
 		coll:      coll,
 		logger:    opts.Logger,
 		predicate: opts.InterfacePredicate,
-		attached:  make(map[int]struct{}),
+		attached:  make(map[int]*attachedIface),
 	}
 	m.m.watchSvc = coll.Maps["watch_svc"]
 	m.m.synCount = coll.Maps["syn_count"]
@@ -184,8 +196,39 @@ func (m *Manager) attachNewInterfaces() (int, error) {
 		return 0, fmt.Errorf("bpf program 'egress_rst_filter' not found")
 	}
 
+	// Snapshot the current interface list into a (index -> name) map
+	// so we can detect ifindex reuse while holding the Manager lock.
+	live := make(map[int]string, len(ifaces))
+	for _, iface := range ifaces {
+		live[iface.Index] = iface.Name
+	}
+
 	m.mu.Lock()
 	defer m.mu.Unlock()
+
+	// Prune stale entries: either the ifindex is gone entirely, or it has
+	// been reused by a different interface (new name). Close the old
+	// link handles in both cases so the next attach pass can re-attach
+	// a fresh pair on the reused ifindex.
+	for idx, st := range m.attached {
+		curName, alive := live[idx]
+		if alive && curName == st.name {
+			continue
+		}
+		if st.ingress != nil {
+			_ = st.ingress.Close()
+		}
+		if st.egress != nil {
+			_ = st.egress.Close()
+		}
+		reason := "vanished"
+		if alive {
+			reason = "ifindex reused"
+		}
+		m.logger.Info("TC detached",
+			"iface", st.name, "index", idx, "reason", reason)
+		delete(m.attached, idx)
+	}
 
 	attached := 0
 	for _, iface := range ifaces {
@@ -195,7 +238,7 @@ func (m *Manager) attachNewInterfaces() (int, error) {
 		if m.predicate != nil && !m.predicate(iface) {
 			continue
 		}
-		if _, ok := m.attached[iface.Index]; ok {
+		if st, ok := m.attached[iface.Index]; ok && st.name == iface.Name {
 			continue
 		}
 		li, err := link.AttachTCX(link.TCXOptions{
@@ -214,8 +257,11 @@ func (m *Manager) attachNewInterfaces() (int, error) {
 			_ = li.Close()
 			continue
 		}
-		m.links = append(m.links, li, le)
-		m.attached[iface.Index] = struct{}{}
+		m.attached[iface.Index] = &attachedIface{
+			name:    iface.Name,
+			ingress: li,
+			egress:  le,
+		}
 		m.logger.Info("TC attached", "iface", iface.Name, "index", iface.Index)
 		attached++
 	}
@@ -250,9 +296,17 @@ func (m *Manager) WatchInterfaces(ctx context.Context, interval time.Duration) {
 
 // Close detaches all programs and closes the collection.
 func (m *Manager) Close() {
-	for _, l := range m.links {
-		_ = l.Close()
+	m.mu.Lock()
+	for idx, st := range m.attached {
+		if st.ingress != nil {
+			_ = st.ingress.Close()
+		}
+		if st.egress != nil {
+			_ = st.egress.Close()
+		}
+		delete(m.attached, idx)
 	}
+	m.mu.Unlock()
 	m.coll.Close()
 }
 

@@ -2,10 +2,14 @@ package agent
 
 import (
 	"context"
+	"crypto/sha256"
 	"crypto/tls"
+	"encoding/hex"
 	"fmt"
 	"net"
 	"strings"
+	"sync"
+	"time"
 
 	authv1 "k8s.io/api/authentication/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -121,46 +125,100 @@ func GenerateSelfSignedTLSConfig() (*tls.Config, error) {
 	}, nil
 }
 
-// AuthInterceptors returns matched unary and stream gRPC interceptors that
-// enforce audience-bound TokenReview on every incoming call. The only
-// audience accepted is AgentAudience, so tokens minted without
-//
-//	projected:
-//	  sources:
-//	    - serviceAccountToken:
-//	        audience: kubewol.io/agent-api
-//
-// cannot reach the handlers even if they otherwise pass kube-apiserver's own
-// token validation. This replaces the per-path nonResourceURL RBAC that the
-// HTTP version used; gRPC methods are not HTTP paths, so SubjectAccessReview
-// on nonResourceURLs would not apply even if we wanted it.
-func AuthInterceptors(k8s kubernetes.Interface) (grpc.UnaryServerInterceptor, grpc.StreamServerInterceptor) {
-	unary := func(
-		ctx context.Context,
-		req interface{},
-		info *grpc.UnaryServerInfo,
-		handler grpc.UnaryHandler,
-	) (interface{}, error) {
-		if err := authenticate(ctx, k8s); err != nil {
-			return nil, err
-		}
-		return handler(ctx, req)
-	}
-	stream := func(
-		srv interface{},
-		ss grpc.ServerStream,
-		info *grpc.StreamServerInfo,
-		handler grpc.StreamHandler,
-	) error {
-		if err := authenticate(ss.Context(), k8s); err != nil {
-			return err
-		}
-		return handler(srv, ss)
-	}
-	return unary, stream
+// tokenReviewCache memoises recent TokenReview decisions so that the agent
+// does not reissue a live TokenReview for every PutWatches / every
+// SubscribeSynEvents reconnect. Kube-apiserver caches TokenReviews itself,
+// but an in-agent cache also:
+//   - caps agent → apiserver traffic under reconnect storms,
+//   - lets us add a concurrency semaphore below without observable latency
+//     for a legitimate steady-state caller,
+//   - makes the negative path (wrong audience) cheap to refuse.
+type tokenReviewCache struct {
+	ttl      time.Duration
+	mu       sync.Mutex
+	entries  map[string]tokenReviewCacheEntry
+	capacity int
 }
 
-func authenticate(ctx context.Context, k8s kubernetes.Interface) error {
+type tokenReviewCacheEntry struct {
+	decision bool
+	deadline time.Time
+}
+
+func newTokenReviewCache(ttl time.Duration, capacity int) *tokenReviewCache {
+	return &tokenReviewCache{
+		ttl:      ttl,
+		entries:  map[string]tokenReviewCacheEntry{},
+		capacity: capacity,
+	}
+}
+
+// lookup returns (decision, ok). ok=false means no fresh entry exists.
+func (c *tokenReviewCache) lookup(key string) (bool, bool) {
+	now := time.Now()
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	e, ok := c.entries[key]
+	if !ok {
+		return false, false
+	}
+	if now.After(e.deadline) {
+		delete(c.entries, key)
+		return false, false
+	}
+	return e.decision, true
+}
+
+// store records a TokenReview decision. Purges aggressively once the map
+// grows past capacity to keep the upper bound on memory.
+func (c *tokenReviewCache) store(key string, decision bool) {
+	deadline := time.Now().Add(c.ttl)
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if len(c.entries) >= c.capacity {
+		// Evict expired entries first; if still full, drop everything.
+		now := time.Now()
+		for k, v := range c.entries {
+			if now.After(v.deadline) {
+				delete(c.entries, k)
+			}
+		}
+		if len(c.entries) >= c.capacity {
+			c.entries = map[string]tokenReviewCacheEntry{}
+		}
+	}
+	c.entries[key] = tokenReviewCacheEntry{decision: decision, deadline: deadline}
+}
+
+// authGate bundles the TokenReview cache and a semaphore that caps the
+// number of in-flight TokenReview calls. An attacker hammering :8444 cannot
+// amplify load on kube-apiserver beyond maxInflightTokenReviews concurrent
+// calls because extra requests wait on the semaphore until their slot is
+// available, then (usually) hit the cache once one legitimate call has
+// primed it.
+type authGate struct {
+	k8s       kubernetes.Interface
+	cache     *tokenReviewCache
+	semaphore chan struct{}
+}
+
+const (
+	tokenReviewCacheTTL      = 60 * time.Second
+	tokenReviewCacheCapacity = 512
+	maxInflightTokenReviews  = 8
+)
+
+func newAuthGate(k8s kubernetes.Interface) *authGate {
+	return &authGate{
+		k8s:       k8s,
+		cache:     newTokenReviewCache(tokenReviewCacheTTL, tokenReviewCacheCapacity),
+		semaphore: make(chan struct{}, maxInflightTokenReviews),
+	}
+}
+
+// authenticate validates the incoming bearer token is bound to AgentAudience.
+// Cache-first; cache miss fans through the concurrency semaphore.
+func (g *authGate) authenticate(ctx context.Context) error {
 	md, ok := metadata.FromIncomingContext(ctx)
 	if !ok {
 		return status.Error(codes.Unauthenticated, "missing metadata")
@@ -174,7 +232,30 @@ func authenticate(ctx context.Context, k8s kubernetes.Interface) error {
 		return status.Error(codes.Unauthenticated, "authorization must be a bearer token")
 	}
 	token := strings.TrimPrefix(raw, "Bearer ")
-	tr, err := k8s.AuthenticationV1().TokenReviews().Create(ctx, &authv1.TokenReview{
+
+	// Cache the SHA-256 of the token so the in-memory map does not
+	// double as a token stash.
+	sum := sha256.Sum256([]byte(token))
+	key := hex.EncodeToString(sum[:])
+
+	if decision, ok := g.cache.lookup(key); ok {
+		if decision {
+			return nil
+		}
+		return status.Errorf(codes.PermissionDenied,
+			"token is not bound to audience %q", AgentAudience)
+	}
+
+	// Respect the in-flight cap. Under backpressure we block until a slot
+	// is free or the caller's context is cancelled.
+	select {
+	case g.semaphore <- struct{}{}:
+		defer func() { <-g.semaphore }()
+	case <-ctx.Done():
+		return status.Error(codes.DeadlineExceeded, "auth timed out waiting for token review slot")
+	}
+
+	tr, err := g.k8s.AuthenticationV1().TokenReviews().Create(ctx, &authv1.TokenReview{
 		Spec: authv1.TokenReviewSpec{
 			Token:     token,
 			Audiences: []string{AgentAudience},
@@ -184,15 +265,49 @@ func authenticate(ctx context.Context, k8s kubernetes.Interface) error {
 		return status.Errorf(codes.Internal, "tokenreview: %v", err)
 	}
 	if !tr.Status.Authenticated {
+		g.cache.store(key, false)
 		return status.Errorf(codes.PermissionDenied,
 			"token is not bound to audience %q", AgentAudience)
 	}
+	g.cache.store(key, true)
 	return nil
 }
 
+// AuthInterceptors returns matched unary and stream gRPC interceptors that
+// enforce audience-bound TokenReview on every incoming call. The underlying
+// authGate caches decisions for tokenReviewCacheTTL and caps concurrent
+// TokenReview fan-out.
+func AuthInterceptors(k8s kubernetes.Interface) (grpc.UnaryServerInterceptor, grpc.StreamServerInterceptor) {
+	gate := newAuthGate(k8s)
+	unary := func(
+		ctx context.Context,
+		req interface{},
+		info *grpc.UnaryServerInfo,
+		handler grpc.UnaryHandler,
+	) (interface{}, error) {
+		if err := gate.authenticate(ctx); err != nil {
+			return nil, err
+		}
+		return handler(ctx, req)
+	}
+	stream := func(
+		srv interface{},
+		ss grpc.ServerStream,
+		info *grpc.StreamServerInfo,
+		handler grpc.StreamHandler,
+	) error {
+		if err := gate.authenticate(ss.Context()); err != nil {
+			return err
+		}
+		return handler(srv, ss)
+	}
+	return unary, stream
+}
+
 // NewGRPCServer builds a grpc.Server with TLS credentials, audience-bound
-// authentication interceptors, and the Agent service registered. Callers
-// Serve() the returned server on their own listener.
+// authentication interceptors (with TokenReview cache + concurrency cap),
+// and the Agent service registered. Callers Serve() the returned server on
+// their own listener.
 func NewGRPCServer(a *Agent, k8s kubernetes.Interface, tlsCfg *tls.Config) *grpc.Server {
 	unary, stream := AuthInterceptors(k8s)
 	srv := grpc.NewServer(
