@@ -94,9 +94,69 @@ func entryKey(e *WatchEntrySpec) string {
 	return fmt.Sprintf("%s/%s/%d", e.Namespace, e.Service, e.Port)
 }
 
+// installEntryLocked programs a single entryState into BPF. On any partial
+// failure it rolls back the steps it already took so the BPF maps do not
+// keep a half-installed entry that the in-memory index would otherwise lose
+// track of. Caller must hold a.mu.
+func (a *Agent) installEntryLocked(st *entryState) error {
+	if _, err := a.bpf.AddWatch(st.ip, st.entry.Port, st.entry.NodePort); err != nil {
+		return fmt.Errorf("AddWatch: %w", err)
+	}
+	if err := a.bpf.SetProxyMode(st.key, st.entry.ProxyMode, st.entry.NodePort); err != nil {
+		_ = a.bpf.RemoveWatch(st.ip, st.entry.Port, st.entry.NodePort)
+		return fmt.Errorf("SetProxyMode: %w", err)
+	}
+	if err := a.bpf.SetRstSuppress(st.key, st.entry.RstSuppress, st.entry.NodePort); err != nil {
+		_ = a.bpf.RemoveWatch(st.ip, st.entry.Port, st.entry.NodePort)
+		return fmt.Errorf("SetRstSuppress: %w", err)
+	}
+	return nil
+}
+
+// uninstallEntryLocked tears a single entry down. Caller must hold a.mu.
+func (a *Agent) uninstallEntryLocked(st *entryState) error {
+	return a.bpf.RemoveWatch(st.ip, st.entry.Port, st.entry.NodePort)
+}
+
+// indexInsertLocked / indexRemoveLocked keep the reverse-lookup indexes in
+// sync with a.entries. Each (bpfKeyIndex, nodePortIndex) row is owned by
+// exactly one entryState; updates never span multiple entries so the
+// caller can treat them as atomic per key.
+func (a *Agent) indexInsertLocked(st *entryState) {
+	entry := st.entry // stable pointer copy
+	a.bpfKeyIndex[st.key] = &entry
+	if st.entry.NodePort > 0 {
+		npKey := uint32(bpf.Htons(uint16(st.entry.NodePort)))
+		a.nodePortIndex[npKey] = &entry
+	}
+}
+
+func (a *Agent) indexRemoveLocked(st *entryState) {
+	delete(a.bpfKeyIndex, st.key)
+	if st.entry.NodePort > 0 {
+		npKey := uint32(bpf.Htons(uint16(st.entry.NodePort)))
+		delete(a.nodePortIndex, npKey)
+	}
+}
+
 // ApplyWatches diffs the incoming set against the current state and installs
 // the difference into BPF. The lock is held for the whole call so concurrent
 // gRPC PutWatches requests serialise cleanly.
+//
+// Mutation semantics: when a logical key (namespace/service/port) already
+// exists but the ClusterIP or NodePort changed, the new BPF state is
+// installed FIRST, then the old BPF state is torn down. Doing it in that
+// order means:
+//
+//  1. Every BPF-side operation for the new entry runs under the old entry's
+//     coverage, so a mid-flight SYN cannot slip through unmonitored.
+//  2. If any step of the new install fails, installEntryLocked rolls back
+//     everything it touched and ApplyWatches returns an error WITHOUT
+//     having disturbed the old entry — the caller retries on the next
+//     reconcile and the agent's view stays consistent with BPF.
+//
+// The old BPF key and the new BPF key are distinct (different
+// address / nodeport), so both coexist during the swap without colliding.
 func (a *Agent) ApplyWatches(specs []WatchEntrySpec) error {
 	a.mu.Lock()
 	defer a.mu.Unlock()
@@ -114,62 +174,61 @@ func (a *Agent) ApplyWatches(specs []WatchEntrySpec) error {
 		want[entryKey(&e)] = &entryState{entry: e, key: bpfKey, ip: ip}
 	}
 
-	// Remove entries that are no longer desired.
+	// Phase 1: remove entries that are no longer desired.
 	for k, st := range a.entries {
 		if _, ok := want[k]; ok {
 			continue
 		}
-		if err := a.bpf.RemoveWatch(st.ip, st.entry.Port, st.entry.NodePort); err != nil {
+		if err := a.uninstallEntryLocked(st); err != nil {
 			return fmt.Errorf("RemoveWatch %s: %w", k, err)
 		}
-		delete(a.bpfKeyIndex, st.key)
-		if st.entry.NodePort > 0 {
-			npKey := uint32(bpf.Htons(uint16(st.entry.NodePort)))
-			delete(a.nodePortIndex, npKey)
-		}
+		a.indexRemoveLocked(st)
 		delete(a.entries, k)
 	}
 
-	// Install / update the desired entries. If an existing entry for the
-	// same logical key (namespace/service/port) now refers to a different
-	// ClusterIP or NodePort — i.e. the Service was deleted and recreated,
-	// or its NodePort was reassigned — the old BPF state has to be torn
-	// down FIRST. Otherwise the stale BPF key stays in the watch / proxy /
-	// rst_suppress maps forever and the reverse index points at a
-	// nonexistent Service.
+	// Phase 2: install or update the desired entries atomically per key.
 	for k, st := range want {
-		if old, ok := a.entries[k]; ok {
-			if !old.ip.Equal(st.ip) || old.entry.NodePort != st.entry.NodePort {
-				if err := a.bpf.RemoveWatch(old.ip, old.entry.Port, old.entry.NodePort); err != nil {
-					return fmt.Errorf("RemoveWatch stale %s: %w", k, err)
-				}
-				delete(a.bpfKeyIndex, old.key)
-				if old.entry.NodePort > 0 {
-					oldNP := uint32(bpf.Htons(uint16(old.entry.NodePort)))
-					delete(a.nodePortIndex, oldNP)
-				}
-				a.logger.V(1).Info("tore down stale BPF state",
-					"key", k,
-					"oldIP", old.ip.String(), "newIP", st.ip.String(),
-					"oldNodePort", old.entry.NodePort, "newNodePort", st.entry.NodePort)
+		old, hadOld := a.entries[k]
+		if hadOld && old.ip.Equal(st.ip) && old.entry.NodePort == st.entry.NodePort {
+			// Same address + same NodePort: no BPF-key mutation. Just
+			// refresh proxy_mode / rst_suppress idempotently.
+			if err := a.bpf.SetProxyMode(st.key, st.entry.ProxyMode, st.entry.NodePort); err != nil {
+				return fmt.Errorf("SetProxyMode %s: %w", k, err)
 			}
+			if err := a.bpf.SetRstSuppress(st.key, st.entry.RstSuppress, st.entry.NodePort); err != nil {
+				return fmt.Errorf("SetRstSuppress %s: %w", k, err)
+			}
+			// Update the stored spec so DirectScale / target fields
+			// follow the incoming data.
+			a.entries[k] = st
+			a.indexRemoveLocked(old)
+			a.indexInsertLocked(st)
+			continue
 		}
-		if _, err := a.bpf.AddWatch(st.ip, st.entry.Port, st.entry.NodePort); err != nil {
-			return fmt.Errorf("AddWatch %s: %w", k, err)
+
+		// Brand-new or mutation (ClusterIP / NodePort changed). Install
+		// the new BPF state first; only on success tear down the old.
+		if err := a.installEntryLocked(st); err != nil {
+			return fmt.Errorf("install %s: %w", k, err)
 		}
-		if err := a.bpf.SetProxyMode(st.key, st.entry.ProxyMode, st.entry.NodePort); err != nil {
-			return fmt.Errorf("SetProxyMode %s: %w", k, err)
-		}
-		if err := a.bpf.SetRstSuppress(st.key, st.entry.RstSuppress, st.entry.NodePort); err != nil {
-			return fmt.Errorf("SetRstSuppress %s: %w", k, err)
+		if hadOld {
+			if err := a.uninstallEntryLocked(old); err != nil {
+				// The new state is already in place and live; the old
+				// one leaked. Log and keep going — returning here would
+				// leave two installed entries AND the error path of the
+				// caller would probably redo installEntryLocked and hit
+				// the same problem.
+				a.logger.Error(err, "failed to tear down stale entry after swap",
+					"key", k, "oldIP", old.ip.String(), "newIP", st.ip.String())
+			}
+			a.indexRemoveLocked(old)
+			a.logger.V(1).Info("swapped stale BPF state",
+				"key", k,
+				"oldIP", old.ip.String(), "newIP", st.ip.String(),
+				"oldNodePort", old.entry.NodePort, "newNodePort", st.entry.NodePort)
 		}
 		a.entries[k] = st
-		entry := st.entry // copy so the index holds a stable pointer
-		a.bpfKeyIndex[st.key] = &entry
-		if st.entry.NodePort > 0 {
-			npKey := uint32(bpf.Htons(uint16(st.entry.NodePort)))
-			a.nodePortIndex[npKey] = &entry
-		}
+		a.indexInsertLocked(st)
 	}
 	a.logger.V(1).Info("watches applied", "count", len(a.entries))
 	return nil

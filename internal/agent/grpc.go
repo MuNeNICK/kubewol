@@ -11,6 +11,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/go-logr/logr"
 	authv1 "k8s.io/api/authentication/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/kubernetes"
@@ -20,6 +21,7 @@ import (
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/credentials"
 	"google.golang.org/grpc/metadata"
+	"google.golang.org/grpc/reflection"
 	"google.golang.org/grpc/status"
 
 	pb "github.com/munenick/kubewol/internal/agentapi/pb"
@@ -125,6 +127,33 @@ func GenerateSelfSignedTLSConfig() (*tls.Config, error) {
 	}, nil
 }
 
+// LoadTLSConfig returns a *tls.Config suitable for the agent gRPC listener.
+// When both certFile and keyFile are set the cert/key pair is loaded from
+// disk — typical deployment path is a cert-manager Certificate Secret
+// mounted as a projected volume, which lets the controller verify the
+// agent cert against the cluster CA. When either path is empty, the agent
+// falls back to a self-signed cert generated in-memory.
+func LoadTLSConfig(certFile, keyFile string) (*tls.Config, error) {
+	if certFile == "" && keyFile == "" {
+		return GenerateSelfSignedTLSConfig()
+	}
+	if certFile == "" || keyFile == "" {
+		return nil, fmt.Errorf(
+			"agent TLS cert/key: both --agent-tls-cert-file and "+
+				"--agent-tls-key-file must be set (got cert=%q key=%q)",
+			certFile, keyFile)
+	}
+	cert, err := tls.LoadX509KeyPair(certFile, keyFile)
+	if err != nil {
+		return nil, fmt.Errorf("load TLS key pair: %w", err)
+	}
+	return &tls.Config{
+		Certificates: []tls.Certificate{cert},
+		NextProtos:   []string{"h2"},
+		MinVersion:   tls.VersionTLS12,
+	}, nil
+}
+
 // tokenReviewCache memoises recent TokenReview decisions so that the agent
 // does not reissue a live TokenReview for every PutWatches / every
 // SubscribeSynEvents reconnect. Kube-apiserver caches TokenReviews itself,
@@ -190,16 +219,19 @@ func (c *tokenReviewCache) store(key string, decision bool) {
 	c.entries[key] = tokenReviewCacheEntry{decision: decision, deadline: deadline}
 }
 
-// authGate bundles the TokenReview cache and a semaphore that caps the
-// number of in-flight TokenReview calls. An attacker hammering :8444 cannot
-// amplify load on kube-apiserver beyond maxInflightTokenReviews concurrent
-// calls because extra requests wait on the semaphore until their slot is
-// available, then (usually) hit the cache once one legitimate call has
-// primed it.
+// authGate bundles the TokenReview cache, a semaphore that caps the number
+// of in-flight TokenReview calls, and an allow-list of expected caller
+// identities so that the audience check alone cannot be turned into "any
+// workload in the cluster may call PutWatches". An attacker hammering :8444
+// cannot amplify load on kube-apiserver beyond maxInflightTokenReviews
+// concurrent calls because extra requests wait on the semaphore.
 type authGate struct {
-	k8s       kubernetes.Interface
-	cache     *tokenReviewCache
-	semaphore chan struct{}
+	k8s           kubernetes.Interface
+	cache         *tokenReviewCache
+	semaphore     chan struct{}
+	allowedUsers  map[string]struct{}
+	allowedUsersS string // joined for error messages
+	logger        logr.Logger
 }
 
 const (
@@ -208,12 +240,29 @@ const (
 	maxInflightTokenReviews  = 8
 )
 
-func newAuthGate(k8s kubernetes.Interface) *authGate {
-	return &authGate{
-		k8s:       k8s,
-		cache:     newTokenReviewCache(tokenReviewCacheTTL, tokenReviewCacheCapacity),
-		semaphore: make(chan struct{}, maxInflightTokenReviews),
+// newAuthGate builds an authGate that validates bearer tokens against
+// kube-apiserver with spec.audiences=[AgentAudience] AND requires the
+// resolved user to be one of allowedUsers. Passing an empty allowedUsers
+// list is a programming error because it collapses the check to
+// "any valid audience-bound token", which is what this gate exists to
+// prevent. Callers are expected to derive the list from the controller SA
+// (e.g. "system:serviceaccount:kubewol-system:kubewol-controller").
+func newAuthGate(k8s kubernetes.Interface, allowedUsers []string, logger logr.Logger) *authGate {
+	g := &authGate{
+		k8s:          k8s,
+		cache:        newTokenReviewCache(tokenReviewCacheTTL, tokenReviewCacheCapacity),
+		semaphore:    make(chan struct{}, maxInflightTokenReviews),
+		allowedUsers: make(map[string]struct{}, len(allowedUsers)),
+		logger:       logger,
 	}
+	for _, u := range allowedUsers {
+		if u == "" {
+			continue
+		}
+		g.allowedUsers[u] = struct{}{}
+	}
+	g.allowedUsersS = strings.Join(allowedUsers, ",")
+	return g
 }
 
 // authenticate validates the incoming bearer token is bound to AgentAudience.
@@ -242,8 +291,12 @@ func (g *authGate) authenticate(ctx context.Context) error {
 		if decision {
 			return nil
 		}
+		// We lose the original rejection reason here (audience mismatch
+		// vs caller identity mismatch) so the client only sees a generic
+		// "previous rejection is still cached" error. The definitive
+		// reason is in the agent log at the time of the first rejection.
 		return status.Errorf(codes.PermissionDenied,
-			"token is not bound to audience %q", AgentAudience)
+			"bearer token was rejected on a previous call; cached until TTL expires")
 	}
 
 	// Respect the in-flight cap. Under backpressure we block until a slot
@@ -265,20 +318,37 @@ func (g *authGate) authenticate(ctx context.Context) error {
 		return status.Errorf(codes.Internal, "tokenreview: %v", err)
 	}
 	if !tr.Status.Authenticated {
+		g.logger.Info("TokenReview rejected token",
+			"error", tr.Status.Error,
+			"audiences", tr.Status.Audiences)
+		g.cache.store(key, false)
+		return status.Errorf(codes.Unauthenticated,
+			"TokenReview rejected bearer token (audience %q): %s",
+			AgentAudience, tr.Status.Error)
+	}
+	// Audience match alone is not enough: any workload in the cluster that
+	// can mint a projected token for its own ServiceAccount with
+	// audience=AgentAudience would otherwise pass. Pin the caller to the
+	// explicit list of expected user identities, which is derived from the
+	// controller Deployment's ServiceAccount at process startup.
+	user := tr.Status.User.Username
+	if _, allowed := g.allowedUsers[user]; !allowed {
+		g.logger.Info("caller identity rejected", "user", user)
 		g.cache.store(key, false)
 		return status.Errorf(codes.PermissionDenied,
-			"token is not bound to audience %q", AgentAudience)
+			"caller %q is not in the allowed users list %q", user, g.allowedUsersS)
 	}
 	g.cache.store(key, true)
 	return nil
 }
 
 // AuthInterceptors returns matched unary and stream gRPC interceptors that
-// enforce audience-bound TokenReview on every incoming call. The underlying
-// authGate caches decisions for tokenReviewCacheTTL and caps concurrent
-// TokenReview fan-out.
-func AuthInterceptors(k8s kubernetes.Interface) (grpc.UnaryServerInterceptor, grpc.StreamServerInterceptor) {
-	gate := newAuthGate(k8s)
+// enforce audience-bound TokenReview plus caller identity pinning on every
+// incoming call. The underlying authGate caches decisions for
+// tokenReviewCacheTTL and caps concurrent TokenReview fan-out. allowedUsers
+// must be non-empty; see newAuthGate.
+func AuthInterceptors(k8s kubernetes.Interface, allowedUsers []string, logger logr.Logger) (grpc.UnaryServerInterceptor, grpc.StreamServerInterceptor) {
+	gate := newAuthGate(k8s, allowedUsers, logger)
 	unary := func(
 		ctx context.Context,
 		req interface{},
@@ -305,16 +375,23 @@ func AuthInterceptors(k8s kubernetes.Interface) (grpc.UnaryServerInterceptor, gr
 }
 
 // NewGRPCServer builds a grpc.Server with TLS credentials, audience-bound
-// authentication interceptors (with TokenReview cache + concurrency cap),
-// and the Agent service registered. Callers Serve() the returned server on
-// their own listener.
-func NewGRPCServer(a *Agent, k8s kubernetes.Interface, tlsCfg *tls.Config) *grpc.Server {
-	unary, stream := AuthInterceptors(k8s)
+// authentication interceptors (with TokenReview cache + concurrency cap
+// + caller identity pin), and the Agent service registered. Callers
+// Serve() the returned server on their own listener. allowedUsers must be
+// non-empty and is typically the controller Deployment's ServiceAccount
+// user name (e.g. "system:serviceaccount:kubewol-system:kubewol-controller").
+func NewGRPCServer(a *Agent, k8s kubernetes.Interface, tlsCfg *tls.Config, allowedUsers []string) *grpc.Server {
+	unary, stream := AuthInterceptors(k8s, allowedUsers, a.logger.WithName("grpc-auth"))
 	srv := grpc.NewServer(
 		grpc.Creds(credentials.NewTLS(tlsCfg)),
 		grpc.UnaryInterceptor(unary),
 		grpc.StreamInterceptor(stream),
 	)
 	pb.RegisterAgentServer(srv, NewGRPCService(a))
+	// gRPC reflection lets grpcurl describe the service for debugging.
+	// The service is already gated by TLS + TokenReview + caller identity,
+	// so reflecting method names does not widen the attack surface
+	// beyond what operators already know from the proto file.
+	reflection.Register(srv)
 	return srv
 }

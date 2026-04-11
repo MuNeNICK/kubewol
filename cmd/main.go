@@ -51,7 +51,12 @@ func init() {
 
 // agentGRPCAddr is the bind address the agent's gRPC listener uses. Kept as a
 // package-level variable so runAgent can read the flag after main() parses.
-var agentGRPCAddr string
+var (
+	agentGRPCAddr       string
+	agentTLSCertFile    string
+	agentTLSKeyFile     string
+	agentAllowedCallers string
+)
 
 func main() {
 	var mode string
@@ -90,6 +95,22 @@ func main() {
 	flag.StringVar(&agentGRPCAddr, "agent-grpc-bind-address", ":8444",
 		"Agent-only. gRPC service bind address. Serves the kubewol.v1.Agent "+
 			"service over TLS with audience-bound TokenReview authentication.")
+	flag.StringVar(&agentTLSCertFile, "agent-tls-cert-file", "",
+		"Agent-only. Optional path to a PEM-encoded TLS certificate to serve on "+
+			"the gRPC listener. When empty the agent mints a self-signed cert "+
+			"in memory at startup.")
+	flag.StringVar(&agentTLSKeyFile, "agent-tls-key-file", "",
+		"Agent-only. Path to the PEM-encoded private key matching "+
+			"--agent-tls-cert-file. Required when cert file is set.")
+	flag.StringVar(&agentAllowedCallers, "agent-allowed-callers",
+		"system:serviceaccount:kubewol-system:kubewol-controller",
+		"Agent-only. Comma-separated list of user names that are permitted to "+
+			"call the kubewol.v1.Agent service. Each entry must match a "+
+			"TokenReview user.username exactly (typically "+
+			"\"system:serviceaccount:<ns>:<sa>\"). The audience check alone is "+
+			"not sufficient because any workload that can mint a projected "+
+			"token for its own SA with audience kubewol.io/agent-api would "+
+			"otherwise pass.")
 	flag.StringVar(&agentTLSCAFile, "agent-tls-ca-file", "",
 		"Controller-only. Path to a PEM CA bundle used to verify agent "+
 			"certificates. If empty the controller dials agents with "+
@@ -222,13 +243,29 @@ func runAgent(probeAddr, metricsAddr, remoteWriteURL, ifaceAllow, ifaceDeny stri
 		}
 	}()
 
-	// Start the gRPC listener for the agent API on a separate port.
-	tlsCfg, err := agent.GenerateSelfSignedTLSConfig()
+	// Start the gRPC listener for the agent API on a separate port. If
+	// --agent-tls-cert-file / --agent-tls-key-file are set (typical
+	// cert-manager Certificate Secret mount), load them; otherwise fall
+	// back to an in-memory self-signed cert — in which case controller
+	// clients must use InsecureSkipVerify and lean on the audience-bound
+	// token + caller identity pin for authentication.
+	tlsCfg, err := agent.LoadTLSConfig(agentTLSCertFile, agentTLSKeyFile)
 	if err != nil {
-		setupLog.Error(err, "generate self-signed TLS config")
+		setupLog.Error(err, "load agent TLS config",
+			"cert", agentTLSCertFile, "key", agentTLSKeyFile)
 		os.Exit(1)
 	}
-	grpcSrv := agent.NewGRPCServer(ag, k8s, tlsCfg)
+	// Parse the allowed caller list. Empty after trimming is a fatal
+	// misconfiguration: the gate would otherwise accept any audience-bound
+	// token, which is exactly the hole --agent-allowed-callers closes.
+	allowed := splitPrefixes(agentAllowedCallers)
+	if len(allowed) == 0 {
+		setupLog.Error(nil, "--agent-allowed-callers must list at least one "+
+			"ServiceAccount user name, e.g. "+
+			"system:serviceaccount:kubewol-system:kubewol-controller")
+		os.Exit(1)
+	}
+	grpcSrv := agent.NewGRPCServer(ag, k8s, tlsCfg, allowed)
 	grpcListener, err := net.Listen("tcp", agentGRPCAddr)
 	if err != nil {
 		setupLog.Error(err, "gRPC listen", "addr", agentGRPCAddr)

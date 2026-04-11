@@ -93,6 +93,12 @@ spec:
             - --health-probe-bind-address=:8081
             - --metrics-bind-address=:8443
             - --agent-grpc-bind-address=:8444
+            # The audience-bound TokenReview alone is not sufficient
+            # authorization because any workload in the cluster can mint a
+            # projected token for its own ServiceAccount with that audience.
+            # Pin the allowed caller to the controller Deployment's SA
+            # (this is the post-kustomize name, kubewol-controller@kubewol-system).
+            - --agent-allowed-callers=system:serviceaccount:kubewol-system:kubewol-controller
             # Enable Remote Write push for fast cold start:
             # - --remote-write-url=http://prometheus-server.monitoring.svc:80/api/v1/write
           ports:
