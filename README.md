@@ -2,7 +2,7 @@
 
 Wake-on-LAN for Kubernetes. eBPF detects TCP SYN and wakes scaled-to-zero workloads.
 
-kubewol is an eBPF-based traffic sensor and Prometheus exporter that enables HPA scale-to-zero with TCP connection preservation. It requires the [HPA `HPAScaleToZero` feature gate](https://kubernetes.io/docs/reference/command-line-tools-reference/feature-gates/) (Alpha since v1.16, [improved in v1.36 with `ScaledToZero` condition](https://github.com/kubernetes/kubernetes/pull/135118)).
+kubewol is an eBPF-based traffic sensor and Prometheus-compatible metrics exporter that enables HPA scale-to-zero with TCP connection preservation. It requires the [HPA `HPAScaleToZero` feature gate](https://kubernetes.io/docs/reference/command-line-tools-reference/feature-gates/) (Alpha since v1.16, [improved in v1.36 with `ScaledToZero` condition](https://github.com/kubernetes/kubernetes/pull/135118)).
 
 ## How it works
 
@@ -144,16 +144,13 @@ The target workload kind (`Deployment` or `StatefulSet`) is auto-detected. Both 
 
 ### Direct scale (fast path)
 
-By default, kubewol is a pure Prometheus exporter and HPA handles all scaling decisions. Cold start is ~19s (dominated by HPA 15s sync period).
+By default, kubewol is a pure metrics exporter and HPA handles all scaling decisions. Cold start is ~19s (dominated by HPA 15s sync period).
 
-Setting `kubewol/direct-scale=true` on **both** the Service AND the target workload enables a fast path:
+Setting `kubewol/direct-scale=true` on the Service enables a fast path:
 
 ```bash
 kubectl annotate svc my-app kubewol/direct-scale=true
-kubectl annotate deploy my-app kubewol/direct-scale=true
 ```
-
-Requiring the annotation on the target workload too prevents privilege escalation: a user who can only mutate Services cannot redirect kubewol to patch arbitrary workloads.
 
 - On SYN detection, kubewol reads the current scale and patches `deployments/scale` or `statefulsets/scale` to **1 only if currently at 0**. Existing replicas from HPA or manual scale-up are never clobbered. Conflict errors (races between nodes or with HPA) are retried.
 - Cold start drops from ~19s to **~3s**
@@ -238,7 +235,7 @@ When a SYN is detected for a scaled-to-zero service, kubewol immediately pushes 
 ## Architecture
 
 ```
-kubewol DaemonSet (one per node, read-only RBAC)
+kubewol agent DaemonSet (one per node, privileged only for BPF/TC)
   |
   +-- TC ingress (eBPF)
   |     proxy_mode map: SYN counting + SYN DROP when no endpoints
@@ -247,18 +244,26 @@ kubewol DaemonSet (one per node, read-only RBAC)
   |     rst_suppress map: RST/ICMP DROP (stays ON 2s after proxy_mode OFF
   |                       to cover kube-proxy iptables propagation delay)
   |
-  +-- controller-runtime Reconciler
-  |     Watches: Service (annotation) -> BPF watch map
-  |     Watches: EndpointSlice        -> proxy_mode / rst_suppress toggle
-  |
-  +-- Prometheus exporter (:9090/metrics)
+  +-- HTTPS metrics (:8443/metrics)
   |     ebpf_service_syn_total counter from BPF map
   |
   +-- Remote Write push (optional)
-        On SYN detection -> POST to Prometheus /api/v1/write
+  |     On SYN detection -> POST to remote_write endpoint
+  |
+  +-- gRPC agent API (:8444)
+        PutWatches + SubscribeSynEvents
 
-External (not part of kubewol):
-  Prometheus -> Prometheus Adapter -> HPA
+kubewol controller Deployment (unprivileged)
+  |
+  +-- controller-runtime Reconciler
+  |     Watches: Service (annotation) -> WatchSpec fanout to agents
+  |     Watches: EndpointSlice        -> proxy_mode / rst_suppress toggle
+  |
+  +-- direct-scale worker pool
+        SYN events from agents -> patch /scale (optional)
+
+External (optional):
+  Prometheus-compatible scraper/storage -> external metrics adapter -> HPA
 ```
 
 ## Performance

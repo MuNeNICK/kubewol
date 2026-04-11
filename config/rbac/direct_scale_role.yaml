@@ -7,10 +7,9 @@
 # compromise of any node-local pod yields cluster-wide scale authority over
 # every Deployment and StatefulSet.
 #
-# In-process annotation checks (kubewol/direct-scale on both the Service and
-# the target workload) reduce ACCIDENTAL misuse by legitimate operators, but
-# they are not a security boundary against an attacker who has code execution
-# in the controller pod.
+# In-process annotation checks (kubewol/direct-scale on the Service) reduce
+# accidental misuse by legitimate operators, but they are not a security
+# boundary against an attacker who has code execution in the controller pod.
 #
 # Mitigations to consider before applying this in production:
 #   1. Skip direct-scale entirely. The default kubewol install only observes

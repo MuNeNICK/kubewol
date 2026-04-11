@@ -190,7 +190,7 @@ func (f *Fleet) refresh(ctx context.Context) error {
 	f.mu.Lock()
 	// Collect newly-added clients while still holding the lock so we can
 	// backfill them with lastSpec once the lock is released.
-	var fresh []*agentClient
+	fresh := make([]*agentClient, 0, len(seen))
 	for key := range seen {
 		if _, ok := f.clients[key]; ok {
 			continue
@@ -318,7 +318,7 @@ func (f *Fleet) PushAll(ctx context.Context, spec *pb.WatchSpec) error {
 	}
 	wg.Wait()
 	close(errCh)
-	var errs []error
+	errs := make([]error, 0, len(targets))
 	for err := range errCh {
 		errs = append(errs, err)
 	}

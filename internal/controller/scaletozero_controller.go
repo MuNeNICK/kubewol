@@ -43,11 +43,8 @@ const (
 	AnnotationTargetName = "kubewol/target-name"
 
 	// AnnotationDirectScale enables eBPF-triggered direct scale 0->1 (fast path).
-	// Must be set on BOTH the Service AND the target workload (Deployment/StatefulSet).
-	// Requiring the annotation on the target prevents privilege escalation: a user who
-	// can only mutate Services cannot redirect kubewol to patch arbitrary workloads.
+	// It is configured on the Service only.
 	//   kubectl annotate svc my-app kubewol/direct-scale=true
-	//   kubectl annotate deploy my-app kubewol/direct-scale=true
 	AnnotationDirectScale = "kubewol/direct-scale"
 
 	targetKindDeployment  = "Deployment"
@@ -128,11 +125,10 @@ type ScaleToZeroReconciler struct {
 // parsedService is the result of validating and extracting the kubewol-relevant
 // fields from a Service.
 type parsedService struct {
-	ip             net.IP
-	ports          []portSpec
-	targetKind     string
-	targetName     string
-	directScaleOpt bool
+	ip         net.IP
+	ports      []portSpec
+	targetKind string
+	targetName string
 }
 
 // parseService validates the Service annotations / spec and looks up the target
@@ -156,12 +152,12 @@ func (r *ScaleToZeroReconciler) parseService(ctx context.Context, svc *corev1.Se
 	if targetName == "" {
 		targetName = svc.Name
 	}
-	targetKind, directScaleOpt, err := r.detectTarget(ctx, svc.Namespace, targetName)
+	targetKind, err := r.detectTarget(ctx, svc.Namespace, targetName)
 	if err != nil {
 		return nil, err
 	}
 
-	var ports []portSpec
+	ports := make([]portSpec, 0, len(svc.Spec.Ports))
 	for _, p := range svc.Spec.Ports {
 		if p.Protocol != corev1.ProtocolTCP && p.Protocol != "" {
 			continue
@@ -173,11 +169,10 @@ func (r *ScaleToZeroReconciler) parseService(ctx context.Context, svc *corev1.Se
 	}
 
 	return &parsedService{
-		ip:             ip,
-		ports:          ports,
-		targetKind:     targetKind,
-		targetName:     targetName,
-		directScaleOpt: directScaleOpt,
+		ip:         ip,
+		ports:      ports,
+		targetKind: targetKind,
+		targetName: targetName,
 	}, nil
 }
 
@@ -313,7 +308,7 @@ func (r *ScaleToZeroReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 		logger.Error(err, "countReadyEndpoints failed; keeping proxy_mode ON")
 		ready = 0
 	}
-	directScale := svc.Annotations[AnnotationDirectScale] == annotationTrue && ps.directScaleOpt
+	directScale := svc.Annotations[AnnotationDirectScale] == annotationTrue
 
 	entries, rstSuppress := r.buildEntries(&svc, ps, ready, directScale)
 	if err := r.pushFleet(ctx, req.NamespacedName, entries, rstSuppress); err != nil {
@@ -334,9 +329,8 @@ func (r *ScaleToZeroReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 	return ctrl.Result{}, nil
 }
 
-// detectTarget returns the kind (Deployment/StatefulSet) of the target workload
-// and whether the target itself opts into direct-scale via annotation.
-func (r *ScaleToZeroReconciler) detectTarget(ctx context.Context, ns, name string) (string, bool, error) {
+// detectTarget returns the kind (Deployment/StatefulSet) of the target workload.
+func (r *ScaleToZeroReconciler) detectTarget(ctx context.Context, ns, name string) (string, error) {
 	key := client.ObjectKey{Namespace: ns, Name: name}
 	reader := r.APIReader
 	if reader == nil {
@@ -345,19 +339,19 @@ func (r *ScaleToZeroReconciler) detectTarget(ctx context.Context, ns, name strin
 
 	var d appsv1.Deployment
 	if err := reader.Get(ctx, key, &d); err == nil {
-		return targetKindDeployment, d.Annotations[AnnotationDirectScale] == annotationTrue, nil
+		return targetKindDeployment, nil
 	} else if !errors.IsNotFound(err) {
-		return "", false, err
+		return "", err
 	}
 
 	var s appsv1.StatefulSet
 	if err := reader.Get(ctx, key, &s); err == nil {
-		return targetKindStatefulSet, s.Annotations[AnnotationDirectScale] == annotationTrue, nil
+		return targetKindStatefulSet, nil
 	} else if !errors.IsNotFound(err) {
-		return "", false, err
+		return "", err
 	}
 
-	return "", false, fmt.Errorf("no Deployment or StatefulSet named %q in namespace %q", name, ns)
+	return "", fmt.Errorf("no Deployment or StatefulSet named %q in namespace %q", name, ns)
 }
 
 type portSpec struct {
@@ -414,9 +408,7 @@ func (r *ScaleToZeroReconciler) countReadyEndpoints(ctx context.Context, ns, svc
 }
 
 // TriggerScale patches the target workload's /scale subresource to 1 only if it
-// is currently at 0. Debounced per target. The live annotation is re-checked
-// against the non-cached APIReader immediately before the patch so a
-// just-removed kubewol/direct-scale takes effect on the very next SYN event.
+// is currently at 0. Debounced per target.
 func (r *ScaleToZeroReconciler) TriggerScale(ctx context.Context, namespace, kind, name string) {
 	key := namespace + "/" + kind + "/" + name
 
@@ -434,12 +426,6 @@ func (r *ScaleToZeroReconciler) TriggerScale(ctx context.Context, namespace, kin
 
 	logger := log.FromContext(ctx).WithName("direct-scale")
 	start := time.Now()
-
-	if !r.isDirectScaleAllowed(ctx, namespace, kind, name) {
-		logger.V(1).Info("direct-scale denied by live annotation check", "target", key)
-		r.clearInflight(key)
-		return
-	}
 
 	newTarget := func() client.Object {
 		switch kind {
@@ -475,31 +461,6 @@ func (r *ScaleToZeroReconciler) TriggerScale(ctx context.Context, namespace, kin
 		return
 	}
 	logger.Info("scaled 0->1", "target", key, "duration", time.Since(start))
-}
-
-// isDirectScaleAllowed re-reads the target workload via the non-cached API
-// reader and returns true only if the kubewol/direct-scale annotation is
-// still "true".
-func (r *ScaleToZeroReconciler) isDirectScaleAllowed(ctx context.Context, namespace, kind, name string) bool {
-	reader := r.APIReader
-	if reader == nil {
-		reader = r.Client
-	}
-	k := client.ObjectKey{Namespace: namespace, Name: name}
-	switch kind {
-	case targetKindStatefulSet:
-		var s appsv1.StatefulSet
-		if err := reader.Get(ctx, k, &s); err != nil {
-			return false
-		}
-		return s.Annotations[AnnotationDirectScale] == annotationTrue
-	default:
-		var d appsv1.Deployment
-		if err := reader.Get(ctx, k, &d); err != nil {
-			return false
-		}
-		return d.Annotations[AnnotationDirectScale] == annotationTrue
-	}
 }
 
 // pruneInflightLocked drops scaleInflight entries older than scaleInflightGC.

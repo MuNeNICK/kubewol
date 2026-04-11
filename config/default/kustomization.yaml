@@ -5,3 +5,4 @@ namePrefix: kubewol-
 resources:
   - ../rbac
   - ../manager
+  - metrics_service.yaml
