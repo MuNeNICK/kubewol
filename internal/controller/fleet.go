@@ -285,8 +285,6 @@ func (f *Fleet) runSubscription(ctx context.Context, ac *agentClient) {
 // lastSpec cache in refresh() ensures it converges on the next reconcile.
 func (f *Fleet) PushAll(ctx context.Context, spec *pb.WatchSpec) error {
 	f.mu.Lock()
-	// Cache the spec so new agents discovered by refresh() can be backfilled.
-	f.lastSpec = spec
 	targets := make([]*agentClient, 0, len(f.clients))
 	for _, ac := range f.clients {
 		targets = append(targets, ac)
@@ -295,6 +293,11 @@ func (f *Fleet) PushAll(ctx context.Context, spec *pb.WatchSpec) error {
 
 	if len(targets) == 0 {
 		f.logger.V(1).Info("PushAll: no agents yet")
+		// No agents to push to, but the caller asked for this spec so
+		// cache it — the next agent that joins should converge on it.
+		f.mu.Lock()
+		f.lastSpec = spec
+		f.mu.Unlock()
 		return nil
 	}
 
@@ -318,6 +321,16 @@ func (f *Fleet) PushAll(ctx context.Context, spec *pb.WatchSpec) error {
 	var errs []error
 	for err := range errCh {
 		errs = append(errs, err)
+	}
+	// Only cache the spec when it was delivered to every agent we know
+	// about. On partial failure the reconciler rolls back r.watches and
+	// will push a different (previous) spec on retry — if we updated
+	// lastSpec here a newly-discovered agent would be backfilled with
+	// the failed spec and diverge from everyone else.
+	if len(errs) == 0 {
+		f.mu.Lock()
+		f.lastSpec = spec
+		f.mu.Unlock()
 	}
 	return errors.Join(errs...)
 }
