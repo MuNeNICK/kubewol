@@ -281,7 +281,14 @@ func (r *ScaleToZeroReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 	var svc corev1.Service
 	if err := r.Get(ctx, req.NamespacedName, &svc); err != nil {
 		if errors.IsNotFound(err) {
-			_ = r.removeWatch(ctx, req.NamespacedName)
+			// Service was deleted. Propagate removeWatch failures so
+			// controller-runtime requeues — otherwise a transient agent
+			// outage at deletion time can leave stale BPF state on a
+			// node indefinitely because there is no later reconcile
+			// event for an object that no longer exists.
+			if err := r.removeWatch(ctx, req.NamespacedName); err != nil {
+				return ctrl.Result{}, fmt.Errorf("remove watch on delete: %w", err)
+			}
 			return ctrl.Result{}, nil
 		}
 		return ctrl.Result{}, err
@@ -293,7 +300,11 @@ func (r *ScaleToZeroReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 		return ctrl.Result{RequeueAfter: 10 * time.Second}, nil
 	}
 	if ps == nil {
-		_ = r.removeWatch(ctx, req.NamespacedName)
+		// Service still exists but is no longer kubewol-enabled. Same
+		// propagation logic as the delete path above.
+		if err := r.removeWatch(ctx, req.NamespacedName); err != nil {
+			return ctrl.Result{}, fmt.Errorf("remove watch on disable: %w", err)
+		}
 		return ctrl.Result{}, nil
 	}
 
@@ -355,16 +366,31 @@ type portSpec struct {
 }
 
 // removeWatch drops the Service's entries from the in-memory view and pushes
-// the updated spec to the fleet. Idempotent.
+// the updated spec to the fleet. On push failure the in-memory deletion is
+// rolled back so the next reconcile retries against the same prev state —
+// otherwise the controller's view would diverge from agent BPF state.
+// Idempotent: no-op when the Service is not currently tracked.
 func (r *ScaleToZeroReconciler) removeWatch(ctx context.Context, name types.NamespacedName) error {
 	r.mu.Lock()
-	if _, ok := r.watches[name]; !ok {
+	prev, ok := r.watches[name]
+	if !ok {
 		r.mu.Unlock()
 		return nil
 	}
 	delete(r.watches, name)
 	r.mu.Unlock()
-	return r.Fleet.PushAll(ctx, r.buildSpec())
+
+	if err := r.Fleet.PushAll(ctx, r.buildSpec()); err != nil {
+		r.mu.Lock()
+		// Only restore if a concurrent reconcile has not already written
+		// a fresh entry for this key.
+		if _, stillGone := r.watches[name]; !stillGone {
+			r.watches[name] = prev
+		}
+		r.mu.Unlock()
+		return err
+	}
+	return nil
 }
 
 // countReadyEndpoints returns the number of endpoints that are ready AND not terminating.

@@ -3,47 +3,51 @@
 # ─────────────────────────────────────────
 # Stage 1: compile the BPF C source to ELF.
 #
-# Done in a pinned Debian builder rather than on the host so the committed
-# internal/ebpf/monitor.o cannot drift relative to bpf/monitor.c — every
-# image build reruns clang against the same source tree that go:embed will
-# pick up in stage 2.
+# Runs on $TARGETPLATFORM (not $BUILDPLATFORM) so apt installs the
+# right asm-generic / arch headers for the target CPU. This image
+# runs under QEMU emulation when cross-building, which is slower
+# than the Go stage below but necessary because BPF object files are
+# arch-specific and depend on /usr/include/<arch>-linux-gnu/asm headers.
 # ─────────────────────────────────────────
 FROM debian:bookworm-slim AS bpfbuilder
+ARG TARGETARCH
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \
         clang \
         llvm \
         libbpf-dev \
         linux-libc-dev \
-        gcc-multilib \
         ca-certificates \
     && rm -rf /var/lib/apt/lists/*
 WORKDIR /workspace
 COPY bpf/ bpf/
 RUN mkdir -p internal/ebpf && \
-    ARCH="$(uname -m)"; \
-    case "$ARCH" in \
-      x86_64)  ASM_INCLUDE=/usr/include/x86_64-linux-gnu ;; \
-      aarch64) ASM_INCLUDE=/usr/include/aarch64-linux-gnu ;; \
-      *)       ASM_INCLUDE="/usr/include/$ARCH-linux-gnu" ;; \
+    case "$TARGETARCH" in \
+      amd64)   BPF_ARCH=x86;   ASM_INCLUDE=/usr/include/x86_64-linux-gnu ;; \
+      arm64)   BPF_ARCH=arm64; ASM_INCLUDE=/usr/include/aarch64-linux-gnu ;; \
+      *) echo "unsupported TARGETARCH=$TARGETARCH" >&2; exit 1 ;; \
     esac; \
-    clang -O2 -g -target bpf -D__TARGET_ARCH_x86 \
+    clang -O2 -g -target bpf -D__TARGET_ARCH_${BPF_ARCH} \
         -I/usr/include -I"$ASM_INCLUDE" \
         -c bpf/monitor.c -o internal/ebpf/monitor.o
 
 # ─────────────────────────────────────────
 # Stage 2: build the Go binary.
-# The freshly-compiled monitor.o is copied in before `go build`, so go:embed
-# always sees the output of stage 1 rather than whatever the host committed.
+#
+# Runs on $BUILDPLATFORM and cross-compiles to $TARGETARCH because
+# Go's native cross-compilation is far faster than QEMU. The freshly
+# built monitor.o is copied in before `go build` so go:embed picks up
+# the stage-1 output rather than whatever the host committed.
 # ─────────────────────────────────────────
-FROM golang:1.26 AS builder
+FROM --platform=$BUILDPLATFORM golang:1.26 AS builder
+ARG TARGETARCH
 WORKDIR /workspace
 COPY go.mod go.sum ./
 RUN go mod download
 COPY cmd/ cmd/
 COPY internal/ internal/
 COPY --from=bpfbuilder /workspace/internal/ebpf/monitor.o internal/ebpf/monitor.o
-RUN CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -a -o manager ./cmd/
+RUN CGO_ENABLED=0 GOOS=linux GOARCH=$TARGETARCH go build -a -o manager ./cmd/
 
 # ─────────────────────────────────────────
 # Stage 3: final image.
