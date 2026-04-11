@@ -2,6 +2,7 @@ package controller
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net"
 	"strconv"
@@ -21,22 +22,39 @@ import (
 // SynEventHandler is invoked for every gRPC stream event received from any agent.
 type SynEventHandler func(ctx context.Context, evt *pb.SynEvent)
 
-// Fleet maintains an up-to-date list of kubewol-agent pods (one per node) by
-// watching the EndpointSlices for the agent headless Service, keeps a
-// per-pod SSE subscription for direct-scale events, and fans a WatchSpec out
-// to every reachable agent on PushAll.
+// FleetOptions tunes the Fleet's TLS and token sourcing for per-agent
+// gRPC connections. Mirrors agentapi.ClientOptions but omits TokenPath
+// because the token path is a process-wide concern owned by main.go.
+type FleetOptions struct {
+	CAFile     string
+	ServerName string
+}
+
+// Fleet maintains the set of kubewol-agent pods reachable over gRPC. It
+// subscribes to EndpointSlices for the agent headless Service via the
+// controller-runtime informer, keeps a per-pod bidirectional stream open
+// for direct-scale SYN events, fans the current WatchSpec out to every
+// reachable agent on PushAll, and backfills new agents with the last
+// pushed snapshot at discovery time so pod restarts converge without
+// waiting for the next reconcile.
 //
-// It is meant to satisfy the AgentFleet interface the reconciler expects.
+// It implements the AgentFleet interface the reconciler expects.
 type Fleet struct {
 	k8s        client.Client
 	logger     logr.Logger
 	namespace  string
-	serviceKey string // e.g. "kubewol-agent" — matches EndpointSlice label
-	port       int    // agent HTTPS port
+	serviceKey string // "kubewol-agent" — matches EndpointSlice label
+	port       int    // agent gRPC port
 	onEvent    SynEventHandler
+	tls        FleetOptions
 
 	mu      sync.Mutex
 	clients map[string]*agentClient // keyed by "ip:port"
+	// lastSpec is the most recent spec PushAll was asked to distribute.
+	// New agents discovered in refresh() receive this snapshot immediately
+	// so a restarted DaemonSet pod rebuilds its BPF state without having
+	// to wait for the next Service/EndpointSlice reconcile event.
+	lastSpec *pb.WatchSpec
 }
 
 type agentClient struct {
@@ -46,9 +64,9 @@ type agentClient struct {
 }
 
 // NewFleet constructs a Fleet. namespace is the namespace the agent DaemonSet
-// runs in; serviceKey is the headless Service name; port is the agent HTTPS
-// port (typically 8443).
-func NewFleet(k8s client.Client, logger logr.Logger, namespace, serviceKey string, port int, onEvent SynEventHandler) *Fleet {
+// runs in; serviceKey is the headless Service name; port is the agent gRPC
+// port (typically 8444); tls configures optional peer verification.
+func NewFleet(k8s client.Client, logger logr.Logger, namespace, serviceKey string, port int, onEvent SynEventHandler, tls FleetOptions) *Fleet {
 	return &Fleet{
 		k8s:        k8s,
 		logger:     logger.WithName("fleet"),
@@ -56,6 +74,7 @@ func NewFleet(k8s client.Client, logger logr.Logger, namespace, serviceKey strin
 		serviceKey: serviceKey,
 		port:       port,
 		onEvent:    onEvent,
+		tls:        tls,
 		clients:    map[string]*agentClient{},
 	}
 }
@@ -77,7 +96,7 @@ func (f *Fleet) Run(ctx context.Context, mgrCache ctrlcache.Cache) {
 
 	// Install an event handler on the EndpointSlice informer scoped to the
 	// kubewol-agent Service. Every Add/Update/Delete triggers refresh(),
-	// which rebuilds the per-pod client set and opens/closes SSE streams.
+	// which rebuilds the per-pod gRPC client set and opens/closes streams.
 	informer, err := mgrCache.GetInformer(ctx, &discoveryv1.EndpointSlice{})
 	if err != nil {
 		f.logger.Error(err, "failed to obtain EndpointSlice informer; falling back to polling")
@@ -169,13 +188,17 @@ func (f *Fleet) refresh(ctx context.Context) error {
 	}
 
 	f.mu.Lock()
-	defer f.mu.Unlock()
-	// Add new clients.
+	// Collect newly-added clients while still holding the lock so we can
+	// backfill them with lastSpec once the lock is released.
+	var fresh []*agentClient
 	for key := range seen {
 		if _, ok := f.clients[key]; ok {
 			continue
 		}
-		c, err := agentapi.NewClient(key, "")
+		c, err := agentapi.NewClientWithOptions(key, agentapi.ClientOptions{
+			CAFile:     f.tls.CAFile,
+			ServerName: f.tls.ServerName,
+		})
 		if err != nil {
 			f.logger.Error(err, "new agent client", "target", key)
 			continue
@@ -183,10 +206,11 @@ func (f *Fleet) refresh(ctx context.Context) error {
 		subCtx, cancel := context.WithCancel(context.Background())
 		ac := &agentClient{target: key, client: c, cancel: cancel}
 		f.clients[key] = ac
+		fresh = append(fresh, ac)
 		go f.runSubscription(subCtx, ac)
 		f.logger.Info("agent registered", "target", key)
 	}
-	// Drop stale clients.
+	// Drop stale clients (pods removed or moved).
 	for key, ac := range f.clients {
 		if _, ok := seen[key]; ok {
 			continue
@@ -195,6 +219,25 @@ func (f *Fleet) refresh(ctx context.Context) error {
 		_ = ac.client.Close()
 		delete(f.clients, key)
 		f.logger.Info("agent dropped", "target", ac.target)
+	}
+	snapshot := f.lastSpec
+	f.mu.Unlock()
+
+	// Backfill any brand-new agents with the most recent WatchSpec so a
+	// restarted DaemonSet pod does not sit with empty BPF state until the
+	// next Service / EndpointSlice reconcile. Best-effort; failures are
+	// logged and the next reconcile will retry.
+	if snapshot != nil && len(fresh) > 0 {
+		for _, ac := range fresh {
+			go func(ac *agentClient) {
+				cctx, cancel := context.WithTimeout(ctx, 5*time.Second)
+				defer cancel()
+				if err := ac.client.PutWatches(cctx, snapshot); err != nil {
+					f.logger.V(1).Info("backfill push failed",
+						"agent", ac.target, "error", err.Error())
+				}
+			}(ac)
+		}
 	}
 	return nil
 }
@@ -230,11 +273,20 @@ func (f *Fleet) runSubscription(ctx context.Context, ac *agentClient) {
 	}
 }
 
-// PushAll fans the given WatchSpec out to every known agent in parallel.
-// Failures are logged but not returned so a single unreachable node cannot
-// stall every other reconcile.
+// PushAll fans the given WatchSpec out to every known agent in parallel and
+// returns an aggregated error describing every failure. The caller
+// (ScaleToZeroReconciler) is expected to requeue the reconcile on any
+// non-nil error so a transient agent outage does not leave the fleet in a
+// partially-applied state.
+//
+// "No agents yet" is reported as a nil error, not a failure: the reconciler
+// would otherwise hot-loop during controller startup before the EndpointSlice
+// informer has delivered the first agent. Once at least one agent exists the
+// lastSpec cache in refresh() ensures it converges on the next reconcile.
 func (f *Fleet) PushAll(ctx context.Context, spec *pb.WatchSpec) error {
 	f.mu.Lock()
+	// Cache the spec so new agents discovered by refresh() can be backfilled.
+	f.lastSpec = spec
 	targets := make([]*agentClient, 0, len(f.clients))
 	for _, ac := range f.clients {
 		targets = append(targets, ac)
@@ -247,6 +299,7 @@ func (f *Fleet) PushAll(ctx context.Context, spec *pb.WatchSpec) error {
 	}
 
 	var wg sync.WaitGroup
+	errCh := make(chan error, len(targets))
 	for _, ac := range targets {
 		wg.Add(1)
 		go func(ac *agentClient) {
@@ -256,11 +309,17 @@ func (f *Fleet) PushAll(ctx context.Context, spec *pb.WatchSpec) error {
 			if err := ac.client.PutWatches(cctx, spec); err != nil {
 				f.logger.V(1).Info("PutWatches failed",
 					"agent", ac.target, "error", err.Error())
+				errCh <- fmt.Errorf("%s: %w", ac.target, err)
 			}
 		}(ac)
 	}
 	wg.Wait()
-	return nil
+	close(errCh)
+	var errs []error
+	for err := range errCh {
+		errs = append(errs, err)
+	}
+	return errors.Join(errs...)
 }
 
 func (f *Fleet) closeAll() {

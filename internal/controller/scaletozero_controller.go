@@ -97,7 +97,7 @@ type AgentFleet interface {
 // ScaleToZeroReconciler reconciles Services annotated with kubewol/enabled=true.
 // This controller owns the Kubernetes API side of kubewol. It never touches
 // BPF; it pushes WatchSpec snapshots to the kubewol-agent DaemonSet via HTTP
-// and receives SYN events back over SSE.
+// and receives SYN events back over the SubscribeSynEvents gRPC stream.
 type ScaleToZeroReconciler struct {
 	client.Client
 	// APIReader is a non-cached client for one-off Deployment/StatefulSet lookups
@@ -229,7 +229,8 @@ func (r *ScaleToZeroReconciler) pushFleet(ctx context.Context, name types.Namesp
 	r.watches[name] = entries
 	r.mu.Unlock()
 
-	spec := r.buildSpecLocked(rstSuppress)
+	_ = rstSuppress // per-Service rstSuppress is recomputed per-entry in buildSpec
+	spec := r.buildSpec()
 	if err := r.Fleet.PushAll(ctx, spec); err != nil {
 		// Roll the in-memory view back so the next reconcile retries cleanly.
 		r.mu.Lock()
@@ -244,11 +245,12 @@ func (r *ScaleToZeroReconciler) pushFleet(ctx context.Context, name types.Namesp
 	return nil
 }
 
-// buildSpecLocked snapshots the current watch map into a pb.WatchSpec the
-// Fleet can send over gRPC. rstSuppress for the currently reconciled Service
-// is applied via ProxyMode + ReadySince comparison; other Services' entries
-// keep their existing RstSuppress flag tracked against the current wall clock.
-func (r *ScaleToZeroReconciler) buildSpecLocked(_ bool) *pb.WatchSpec {
+// buildSpec snapshots the current watch map into a pb.WatchSpec the Fleet
+// can send over gRPC. rstSuppress is recomputed per-entry against the
+// current wall clock and each entry's ReadySince — no per-call parameter is
+// needed because the reconciler holds the authoritative ReadySince on the
+// WatchEntry itself.
+func (r *ScaleToZeroReconciler) buildSpec() *pb.WatchSpec {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
 	now := time.Now()
@@ -362,7 +364,7 @@ func (r *ScaleToZeroReconciler) removeWatch(ctx context.Context, name types.Name
 	}
 	delete(r.watches, name)
 	r.mu.Unlock()
-	return r.Fleet.PushAll(ctx, r.buildSpecLocked(false))
+	return r.Fleet.PushAll(ctx, r.buildSpec())
 }
 
 // countReadyEndpoints returns the number of endpoints that are ready AND not terminating.

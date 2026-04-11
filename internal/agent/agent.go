@@ -66,9 +66,9 @@ type Agent struct {
 
 	// subMu protects subs.
 	subMu sync.Mutex
-	// subs is the set of live SSE-style subscribers — typically a single
-	// gRPC stream from the controller, but N when the controller restarts
-	// and reconnects before the old one tears down.
+	// subs is the set of live SubscribeSynEvents gRPC stream subscribers —
+	// typically a single stream from the controller, but N when the
+	// controller restarts and reconnects before the old one tears down.
 	subs map[chan SynEvent]struct{}
 }
 
@@ -130,8 +130,30 @@ func (a *Agent) ApplyWatches(specs []WatchEntrySpec) error {
 		delete(a.entries, k)
 	}
 
-	// Install / update the desired entries.
+	// Install / update the desired entries. If an existing entry for the
+	// same logical key (namespace/service/port) now refers to a different
+	// ClusterIP or NodePort — i.e. the Service was deleted and recreated,
+	// or its NodePort was reassigned — the old BPF state has to be torn
+	// down FIRST. Otherwise the stale BPF key stays in the watch / proxy /
+	// rst_suppress maps forever and the reverse index points at a
+	// nonexistent Service.
 	for k, st := range want {
+		if old, ok := a.entries[k]; ok {
+			if !old.ip.Equal(st.ip) || old.entry.NodePort != st.entry.NodePort {
+				if err := a.bpf.RemoveWatch(old.ip, old.entry.Port, old.entry.NodePort); err != nil {
+					return fmt.Errorf("RemoveWatch stale %s: %w", k, err)
+				}
+				delete(a.bpfKeyIndex, old.key)
+				if old.entry.NodePort > 0 {
+					oldNP := uint32(bpf.Htons(uint16(old.entry.NodePort)))
+					delete(a.nodePortIndex, oldNP)
+				}
+				a.logger.V(1).Info("tore down stale BPF state",
+					"key", k,
+					"oldIP", old.ip.String(), "newIP", st.ip.String(),
+					"oldNodePort", old.entry.NodePort, "newNodePort", st.entry.NodePort)
+			}
+		}
 		if _, err := a.bpf.AddWatch(st.ip, st.entry.Port, st.entry.NodePort); err != nil {
 			return fmt.Errorf("AddWatch %s: %w", k, err)
 		}
