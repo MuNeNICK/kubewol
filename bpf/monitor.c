@@ -30,6 +30,15 @@
 #define IPPROTO_TCP  6
 #define IPPROTO_ICMP 1
 
+// KUBEWOL_MAX_ENTRIES bounds every per-Service BPF hash map (watch_svc,
+// syn_count, proxy_mode, rst_suppress, nodeport_*). Bumped above the
+// previous 256 so mid-size clusters (hundreds of watched Services × ports)
+// do not silently start losing updates at runtime. Override at build time
+// with -DKUBEWOL_MAX_ENTRIES=N if you need more.
+#ifndef KUBEWOL_MAX_ENTRIES
+#define KUBEWOL_MAX_ENTRIES 4096
+#endif
+
 // TCP flag bits in the 13th byte of the TCP header.
 #define TCP_FLAG_SYN 0x02
 #define TCP_FLAG_RST 0x04
@@ -83,7 +92,7 @@ struct syn_event {
 // Watched services: userspace populates with ClusterIP:port -> 1
 struct {
     __uint(type, BPF_MAP_TYPE_HASH);
-    __uint(max_entries, 256);
+    __uint(max_entries, KUBEWOL_MAX_ENTRIES);
     __type(key, struct svc_key);
     __type(value, __u8);
 } watch_svc SEC(".maps");
@@ -91,7 +100,7 @@ struct {
 // SYN counter per watched service (for Prometheus metrics)
 struct {
     __uint(type, BPF_MAP_TYPE_HASH);
-    __uint(max_entries, 256);
+    __uint(max_entries, KUBEWOL_MAX_ENTRIES);
     __type(key, struct svc_key);
     __type(value, __u64);
 } syn_count SEC(".maps");
@@ -99,7 +108,7 @@ struct {
 // Proxy mode: SYN DROP when no endpoints (ingress)
 struct {
     __uint(type, BPF_MAP_TYPE_HASH);
-    __uint(max_entries, 256);
+    __uint(max_entries, KUBEWOL_MAX_ENTRIES);
     __type(key, struct svc_key);
     __type(value, __u8);
 } proxy_mode SEC(".maps");
@@ -108,7 +117,7 @@ struct {
 // than proxy_mode to cover the kube-proxy rule propagation gap.
 struct {
     __uint(type, BPF_MAP_TYPE_HASH);
-    __uint(max_entries, 256);
+    __uint(max_entries, KUBEWOL_MAX_ENTRIES);
     __type(key, struct svc_key);
     __type(value, __u8);
 } rst_suppress SEC(".maps");
@@ -116,7 +125,7 @@ struct {
 // NodePort proxy mode: SYN DROP (ingress)
 struct {
     __uint(type, BPF_MAP_TYPE_HASH);
-    __uint(max_entries, 256);
+    __uint(max_entries, KUBEWOL_MAX_ENTRIES);
     __type(key, __u32);
     __type(value, __u8);
 } nodeport_mode SEC(".maps");
@@ -124,7 +133,7 @@ struct {
 // NodePort RST suppress: RST/ICMP DROP (egress)
 struct {
     __uint(type, BPF_MAP_TYPE_HASH);
-    __uint(max_entries, 256);
+    __uint(max_entries, KUBEWOL_MAX_ENTRIES);
     __type(key, __u32);
     __type(value, __u8);
 } nodeport_rst_suppress SEC(".maps");
@@ -133,7 +142,7 @@ struct {
 // key=nodePort (network byte order, padded to u32), value=svc_key (ClusterIP:port)
 struct {
     __uint(type, BPF_MAP_TYPE_HASH);
-    __uint(max_entries, 256);
+    __uint(max_entries, KUBEWOL_MAX_ENTRIES);
     __type(key, __u32);
     __type(value, struct svc_key);
 } nodeport_to_svc SEC(".maps");

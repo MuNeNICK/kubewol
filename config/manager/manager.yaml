@@ -11,8 +11,9 @@ metadata:
 #
 # Owns the eBPF programs, the BPF maps and the ring buffer reader. Runs on
 # every node with hostNetwork + CAP_BPF + CAP_NET_ADMIN. Exposes the agent
-# HTTP API (PUT /v1/watches, GET /v1/syn-events) and a Prometheus /metrics
-# endpoint via controller-runtime's TLS + TokenReview server.
+# kubewol.v1.Agent gRPC service (PutWatches, SubscribeSynEvents) on port 8444
+# and a Prometheus /metrics endpoint on port 8443 via controller-runtime's
+# TLS + TokenReview server.
 # ─────────────────────────────────────────────────────────────────────────────
 apiVersion: v1
 kind: ServiceAccount
@@ -146,7 +147,7 @@ spec:
 #
 # Runs the Kubernetes API reconcile loop, discovers agents via the headless
 # Service above, pushes WatchSpec snapshots to each agent, and triggers
-# direct-scale on SYN events streamed back over SSE. Zero privileges: no
+# direct-scale on SYN events streamed back over gRPC. Zero privileges: no
 # hostNetwork, no capabilities, no root, no BPF access.
 # ─────────────────────────────────────────────────────────────────────────────
 apiVersion: v1
