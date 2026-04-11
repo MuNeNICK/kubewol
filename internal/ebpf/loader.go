@@ -56,9 +56,17 @@ var dropReasonNames = map[DropReason]string{
 
 // SvcKey matches struct svc_key in monitor.c.
 type SvcKey struct {
-	Addr uint32
-	Port uint16
-	Pad  uint16
+	Addr  uint32
+	Port  uint16
+	Proto uint8
+	Pad   uint8
+}
+
+// NodePortKey matches struct nodeport_key in monitor.c.
+type NodePortKey struct {
+	Port  uint16
+	Proto uint8
+	Pad   uint8
 }
 
 // SynEvent matches struct syn_event in monitor.c.
@@ -67,7 +75,14 @@ type SynEvent struct {
 	DstAddr uint32
 	SrcPort uint16
 	DstPort uint16
+	Proto   uint8
+	Pad     [3]byte
 }
+
+const (
+	ProtoTCP uint8 = 6
+	ProtoUDP uint8 = 17
+)
 
 // Options configure optional behavior of the Manager.
 type Options struct {
@@ -320,21 +335,25 @@ func (m *Manager) SynEventsMap() *ebpf.Map { return m.m.synEvents }
 //
 // The nodeport_to_svc map IS populated here because it is a static lookup
 // table (NodePort -> ClusterIP key), independent of proxy state.
-func (m *Manager) AddWatch(clusterIP net.IP, port uint16, nodePort int32) (SvcKey, error) {
+func (m *Manager) AddWatch(clusterIP net.IP, port uint16, nodePort int32, protocol string) (SvcKey, error) {
 	if clusterIP.To4() == nil {
 		return SvcKey{}, ErrIPv6Unsupported
+	}
+	proto, ok := ProtocolNumber(protocol)
+	if !ok {
+		return SvcKey{}, fmt.Errorf("unsupported protocol %q", protocol)
 	}
 
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
-	key := SvcKey{Addr: ipToUint32(clusterIP), Port: Htons(port)}
+	key := SvcKey{Addr: ipToUint32(clusterIP), Port: Htons(port), Proto: proto}
 	var val uint8 = 1
 	if err := m.m.watchSvc.Update(key, val, ebpf.UpdateAny); err != nil {
 		return key, fmt.Errorf("update watch_svc: %w", err)
 	}
 	if nodePort > 0 {
-		npKey := uint32(Htons(uint16(nodePort)))
+		npKey := MakeNodePortKey(uint16(nodePort), proto)
 		if err := m.m.nodeportToSvc.Update(npKey, key, ebpf.UpdateAny); err != nil {
 			// Roll back watch_svc to avoid partial state.
 			_ = m.m.watchSvc.Delete(key)
@@ -346,15 +365,19 @@ func (m *Manager) AddWatch(clusterIP net.IP, port uint16, nodePort int32) (SvcKe
 
 // RemoveWatch removes a ClusterIP:port from all BPF maps.
 // Errors are aggregated and returned.
-func (m *Manager) RemoveWatch(clusterIP net.IP, port uint16, nodePort int32) error {
+func (m *Manager) RemoveWatch(clusterIP net.IP, port uint16, nodePort int32, protocol string) error {
 	if clusterIP.To4() == nil {
+		return nil
+	}
+	proto, ok := ProtocolNumber(protocol)
+	if !ok {
 		return nil
 	}
 
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
-	key := SvcKey{Addr: ipToUint32(clusterIP), Port: Htons(port)}
+	key := SvcKey{Addr: ipToUint32(clusterIP), Port: Htons(port), Proto: proto}
 	var errs []error
 	del := func(mapName string, target *ebpf.Map, k any) {
 		if err := target.Delete(k); err != nil && !errors.Is(err, ebpf.ErrKeyNotExist) {
@@ -366,7 +389,7 @@ func (m *Manager) RemoveWatch(clusterIP net.IP, port uint16, nodePort int32) err
 	del("proxy_mode", m.m.proxyMode, key)
 	del("rst_suppress", m.m.rstSuppress, key)
 	if nodePort > 0 {
-		npKey := uint32(Htons(uint16(nodePort)))
+		npKey := MakeNodePortKey(uint16(nodePort), proto)
 		del("nodeport_mode", m.m.nodeportMode, npKey)
 		del("nodeport_rst_suppress", m.m.nodeportRstSuppress, npKey)
 		del("nodeport_to_svc", m.m.nodeportToSvc, npKey)
@@ -430,7 +453,7 @@ func (m *Manager) setDual(
 	if nodePort <= 0 {
 		return nil
 	}
-	npKey := uint32(Htons(uint16(nodePort)))
+	npKey := MakeNodePortKey(uint16(nodePort), key.Proto)
 
 	rollback := func() error {
 		if hadPrior {
@@ -492,9 +515,9 @@ func (m *Manager) DropCounts() (map[string]uint64, error) {
 	return out, nil
 }
 
-// ReadSynCount reads the cumulative SYN count for a key. Returns (count, error).
+// ReadPacketCount reads the cumulative wake-packet count for a key.
 // A missing entry yields (0, nil); real lookup errors are surfaced.
-func (m *Manager) ReadSynCount(key SvcKey) (uint64, error) {
+func (m *Manager) ReadPacketCount(key SvcKey) (uint64, error) {
 	var count uint64
 	if err := m.m.synCount.Lookup(key, &count); err != nil {
 		if errors.Is(err, ebpf.ErrKeyNotExist) {
@@ -503,6 +526,25 @@ func (m *Manager) ReadSynCount(key SvcKey) (uint64, error) {
 		return 0, fmt.Errorf("lookup syn_count: %w", err)
 	}
 	return count, nil
+}
+
+// ProtocolNumber converts a Kubernetes Service protocol string to the IP
+// protocol number stored in BPF map keys. Empty is treated as TCP because that
+// is the Kubernetes default for Service ports.
+func ProtocolNumber(protocol string) (uint8, bool) {
+	switch protocol {
+	case "", "TCP":
+		return ProtoTCP, true
+	case "UDP":
+		return ProtoUDP, true
+	default:
+		return 0, false
+	}
+}
+
+// MakeNodePortKey builds the protocol-aware NodePort map key used by BPF.
+func MakeNodePortKey(port uint16, proto uint8) NodePortKey {
+	return NodePortKey{Port: Htons(port), Proto: proto}
 }
 
 // Helpers

@@ -28,6 +28,7 @@
 #endif
 
 #define IPPROTO_TCP  6
+#define IPPROTO_UDP  17
 #define IPPROTO_ICMP 1
 
 // KUBEWOL_MAX_ENTRIES bounds every per-Service BPF hash map (watch_svc,
@@ -72,24 +73,34 @@
 #define ICMP_CODE_OFF     1
 #define ICMP_INNER_OFF    8  /* inner IP starts at ICMP + 8 (RFC 792) */
 
-// Key: Service ClusterIP + port
+// Key: Service ClusterIP + port + protocol
 struct svc_key {
     __u32 addr; // network byte order
     __u16 port; // network byte order
-    __u16 pad;
+    __u8  proto;
+    __u8  pad;
 };
 
-// Ring buffer event: SYN detected for a scaled-to-zero service
+// Key: NodePort + protocol
+struct nodeport_key {
+    __u16 port; // network byte order
+    __u8  proto;
+    __u8  pad;
+};
+
+// Ring buffer event: first packet detected for a scaled-to-zero service
 struct syn_event {
     __u32 src_addr;
     __u32 dst_addr;
     __u16 src_port;
     __u16 dst_port;
+    __u8  proto;
+    __u8  pad[3];
 };
 
 // ── shared maps (used by both ingress and egress programs) ──
 
-// Watched services: userspace populates with ClusterIP:port -> 1
+// Watched services: userspace populates with ClusterIP:port:proto -> 1
 struct {
     __uint(type, BPF_MAP_TYPE_HASH);
     __uint(max_entries, KUBEWOL_MAX_ENTRIES);
@@ -97,7 +108,7 @@ struct {
     __type(value, __u8);
 } watch_svc SEC(".maps");
 
-// SYN counter per watched service (for Prometheus metrics)
+// Wake-packet counter per watched service (for Prometheus metrics)
 struct {
     __uint(type, BPF_MAP_TYPE_HASH);
     __uint(max_entries, KUBEWOL_MAX_ENTRIES);
@@ -105,7 +116,7 @@ struct {
     __type(value, __u64);
 } syn_count SEC(".maps");
 
-// Proxy mode: SYN DROP when no endpoints (ingress)
+// Proxy mode: first-packet DROP when no endpoints (ingress)
 struct {
     __uint(type, BPF_MAP_TYPE_HASH);
     __uint(max_entries, KUBEWOL_MAX_ENTRIES);
@@ -122,11 +133,11 @@ struct {
     __type(value, __u8);
 } rst_suppress SEC(".maps");
 
-// NodePort proxy mode: SYN DROP (ingress)
+// NodePort proxy mode: first-packet DROP (ingress)
 struct {
     __uint(type, BPF_MAP_TYPE_HASH);
     __uint(max_entries, KUBEWOL_MAX_ENTRIES);
-    __type(key, __u32);
+    __type(key, struct nodeport_key);
     __type(value, __u8);
 } nodeport_mode SEC(".maps");
 
@@ -134,20 +145,19 @@ struct {
 struct {
     __uint(type, BPF_MAP_TYPE_HASH);
     __uint(max_entries, KUBEWOL_MAX_ENTRIES);
-    __type(key, __u32);
+    __type(key, struct nodeport_key);
     __type(value, __u8);
 } nodeport_rst_suppress SEC(".maps");
 
-// NodePort -> ClusterIP:port mapping for SYN counting
-// key=nodePort (network byte order, padded to u32), value=svc_key (ClusterIP:port)
+// NodePort -> ClusterIP:port:proto mapping for packet counting
 struct {
     __uint(type, BPF_MAP_TYPE_HASH);
     __uint(max_entries, KUBEWOL_MAX_ENTRIES);
-    __type(key, __u32);
+    __type(key, struct nodeport_key);
     __type(value, struct svc_key);
 } nodeport_to_svc SEC(".maps");
 
-// Ring buffer for instant SYN notifications to userspace
+// Ring buffer for instant wake notifications to userspace
 struct {
     __uint(type, BPF_MAP_TYPE_RINGBUF);
     __uint(max_entries, 4096);
@@ -235,7 +245,7 @@ static __always_inline int read_ip_header(
 }
 
 // ─────────────────────────────────────────
-// TC ingress: detect SYN, count, notify
+// TC ingress: detect wake-trigger packet, count, notify
 // ─────────────────────────────────────────
 SEC("tc")
 int traffic_monitor(struct __sk_buff *skb)
@@ -249,26 +259,29 @@ int traffic_monitor(struct __sk_buff *skb)
     __u32 saddr, daddr;
     if (!read_ip_header(skb, l3_off, &ihl, &proto, &saddr, &daddr))
         return TC_ACT_OK;
-    if (proto != IPPROTO_TCP)
+    if (proto != IPPROTO_TCP && proto != IPPROTO_UDP)
         return TC_ACT_OK;
 
     __u32 l4_off = l3_off + ihl;
     __u16 sport = 0, dport = 0;
-    __u8 flags = 0;
     if (bpf_skb_load_bytes(skb, l4_off + TCP_SPORT_OFF, &sport, sizeof(sport)) < 0)
         return TC_ACT_OK;
     if (bpf_skb_load_bytes(skb, l4_off + TCP_DPORT_OFF, &dport, sizeof(dport)) < 0)
         return TC_ACT_OK;
-    if (bpf_skb_load_bytes(skb, l4_off + TCP_FLAGS_OFF, &flags, sizeof(flags)) < 0)
-        return TC_ACT_OK;
+    if (proto == IPPROTO_TCP) {
+        __u8 flags = 0;
+        if (bpf_skb_load_bytes(skb, l4_off + TCP_FLAGS_OFF, &flags, sizeof(flags)) < 0)
+            return TC_ACT_OK;
 
-    // Only pure SYN (new connection attempt)
-    if (!(flags & TCP_FLAG_SYN) || (flags & TCP_FLAG_ACK))
-        return TC_ACT_OK;
+        // Only pure SYN (new connection attempt)
+        if (!(flags & TCP_FLAG_SYN) || (flags & TCP_FLAG_ACK))
+            return TC_ACT_OK;
+    }
 
     struct svc_key key = {
         .addr = daddr,
         .port = dport,
+        .proto = proto,
         .pad  = 0,
     };
 
@@ -278,14 +291,19 @@ int traffic_monitor(struct __sk_buff *skb)
     // Fallback: NodePort -> resolve to ClusterIP key
     struct svc_key count_key = key;
     if (!watched) {
-        __u32 dport_pad = dport;
-        struct svc_key *resolved = bpf_map_lookup_elem(&nodeport_to_svc, &dport_pad);
+        struct nodeport_key npkey = {
+            .port = dport,
+            .proto = proto,
+            .pad = 0,
+        };
+        struct svc_key *resolved = bpf_map_lookup_elem(&nodeport_to_svc, &npkey);
         if (!resolved)
             return TC_ACT_OK;
         count_key = *resolved;
     }
 
-    // Increment SYN counter (using ClusterIP key for both ClusterIP and NodePort SYNs)
+    // Increment wake-packet counter (using ClusterIP key for both ClusterIP and
+    // NodePort traffic).
     __u64 *cnt = bpf_map_lookup_elem(&syn_count, &count_key);
     if (cnt) {
         __sync_fetch_and_add(cnt, 1);
@@ -301,8 +319,12 @@ int traffic_monitor(struct __sk_buff *skb)
     if (pmode && *pmode) {
         scaled_to_zero = 1;
     } else {
-        __u32 dport_pad = dport;
-        __u8 *nmode = bpf_map_lookup_elem(&nodeport_mode, &dport_pad);
+        struct nodeport_key npkey = {
+            .port = dport,
+            .proto = proto,
+            .pad = 0,
+        };
+        __u8 *nmode = bpf_map_lookup_elem(&nodeport_mode, &npkey);
         if (nmode && *nmode)
             scaled_to_zero = 1;
     }
@@ -316,13 +338,14 @@ int traffic_monitor(struct __sk_buff *skb)
             evt->dst_addr = daddr;
             evt->src_port = sport;
             evt->dst_port = dport;
+            evt->proto = proto;
             bpf_ringbuf_submit(evt, 0);
         } else {
             drop_inc(DROP_RINGBUF_RESERVE);
         }
-        // DROP the SYN: prevents conntrack entry, client TCP stack retransmits.
-        // When pod becomes ready and proxy_mode turns OFF, the retransmit
-        // passes through, DNAT works, and the SAME TCP connection succeeds.
+        // DROP the first packet. For TCP this preserves transparent cold start
+        // via kernel SYN retransmit. For UDP this is trigger-only: upper layers
+        // must retry if they need the first datagram to succeed.
         return TC_ACT_SHOT;
     }
 
@@ -386,10 +409,11 @@ int egress_rst_filter(struct __sk_buff *skb)
         if (bpf_skb_load_bytes(skb, l4_off + TCP_SPORT_OFF, &sport, sizeof(sport)) < 0)
             return TC_ACT_OK;
 
-        // Check 1: src is ClusterIP:port
+        // Check 1: src is ClusterIP:port over TCP
         struct svc_key key = {
             .addr = saddr,
             .port = sport,
+            .proto = IPPROTO_TCP,
             .pad  = 0,
         };
         __u8 *rs = bpf_map_lookup_elem(&rst_suppress, &key);
@@ -398,8 +422,12 @@ int egress_rst_filter(struct __sk_buff *skb)
         }
 
         // Check 2: src port is a NodePort (reverse-NATed RST)
-        __u32 sport_pad = sport;
-        __u8 *nrs = bpf_map_lookup_elem(&nodeport_rst_suppress, &sport_pad);
+        struct nodeport_key npkey = {
+            .port = sport,
+            .proto = IPPROTO_TCP,
+            .pad = 0,
+        };
+        __u8 *nrs = bpf_map_lookup_elem(&nodeport_rst_suppress, &npkey);
         if (nrs && *nrs) {
             return TC_ACT_SHOT;
         }
@@ -429,7 +457,7 @@ int egress_rst_filter(struct __sk_buff *skb)
         __u8 inner_proto;
         if (bpf_skb_load_bytes(skb, inner_off + IP_PROTO_OFF, &inner_proto, sizeof(inner_proto)) < 0)
             return TC_ACT_OK;
-        if (inner_proto != IPPROTO_TCP)
+        if (inner_proto != IPPROTO_TCP && inner_proto != IPPROTO_UDP)
             return TC_ACT_OK;
 
         __u32 inner_daddr = 0;
@@ -444,6 +472,7 @@ int egress_rst_filter(struct __sk_buff *skb)
         struct svc_key key = {
             .addr = inner_daddr,
             .port = inner_dport,
+            .proto = inner_proto,
             .pad  = 0,
         };
         __u8 *rs = bpf_map_lookup_elem(&rst_suppress, &key);
@@ -451,8 +480,12 @@ int egress_rst_filter(struct __sk_buff *skb)
             return TC_ACT_SHOT;
         }
         // Check NodePort match
-        __u32 dport_pad = inner_dport;
-        __u8 *nrs = bpf_map_lookup_elem(&nodeport_rst_suppress, &dport_pad);
+        struct nodeport_key npkey = {
+            .port = inner_dport,
+            .proto = inner_proto,
+            .pad = 0,
+        };
+        __u8 *nrs = bpf_map_lookup_elem(&nodeport_rst_suppress, &npkey);
         if (nrs && *nrs) {
             return TC_ACT_SHOT;
         }

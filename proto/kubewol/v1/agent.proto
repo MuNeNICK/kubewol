@@ -29,9 +29,9 @@ message WatchSpec {
   repeated WatchEntry watches = 1;
 }
 
-// WatchEntry describes one Service that the agent must track. A Service
-// with multiple TCP ports yields multiple entries; they share the workload
-// target fields and differ only in port / node_port.
+// WatchEntry describes one Service port/protocol tuple that the agent must
+// track. A Service with multiple TCP/UDP ports yields multiple entries; they
+// share the workload target fields and differ in protocol / port / node_port.
 message WatchEntry {
   string namespace = 1;
   string service = 2;
@@ -43,6 +43,7 @@ message WatchEntry {
   bool proxy_mode = 8;      // BPF: SYN DROP on ingress
   bool rst_suppress = 9;    // BPF: RST/ICMP DROP on egress
   bool direct_scale = 10;   // agent emits SSE events for this entry
+  string protocol = 11;     // "TCP" or "UDP"
 }
 
 message PutWatchesResponse {}

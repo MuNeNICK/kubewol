@@ -67,9 +67,9 @@ func (x *WatchSpec) GetWatches() []*WatchEntry {
 	return nil
 }
 
-// WatchEntry describes one Service that the agent must track. A Service
-// with multiple TCP ports yields multiple entries; they share the workload
-// target fields and differ only in port / node_port.
+// WatchEntry describes one Service port/protocol tuple that the agent must
+// track. A Service with multiple TCP/UDP ports yields multiple entries; they
+// share the workload target fields and differ in protocol / port / node_port.
 type WatchEntry struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
 	Namespace     string                 `protobuf:"bytes,1,opt,name=namespace,proto3" json:"namespace,omitempty"`
@@ -82,6 +82,7 @@ type WatchEntry struct {
 	ProxyMode     bool                   `protobuf:"varint,8,opt,name=proxy_mode,json=proxyMode,proto3" json:"proxy_mode,omitempty"`        // BPF: SYN DROP on ingress
 	RstSuppress   bool                   `protobuf:"varint,9,opt,name=rst_suppress,json=rstSuppress,proto3" json:"rst_suppress,omitempty"`  // BPF: RST/ICMP DROP on egress
 	DirectScale   bool                   `protobuf:"varint,10,opt,name=direct_scale,json=directScale,proto3" json:"direct_scale,omitempty"` // agent emits SSE events for this entry
+	Protocol      string                 `protobuf:"bytes,11,opt,name=protocol,proto3" json:"protocol,omitempty"`                           // "TCP" or "UDP"
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -184,6 +185,13 @@ func (x *WatchEntry) GetDirectScale() bool {
 		return x.DirectScale
 	}
 	return false
+}
+
+func (x *WatchEntry) GetProtocol() string {
+	if x != nil {
+		return x.Protocol
+	}
+	return ""
 }
 
 type PutWatchesResponse struct {
@@ -326,7 +334,7 @@ const file_kubewol_v1_agent_proto_rawDesc = "" +
 	"\x16kubewol/v1/agent.proto\x12\n" +
 	"kubewol.v1\"=\n" +
 	"\tWatchSpec\x120\n" +
-	"\awatches\x18\x01 \x03(\v2\x16.kubewol.v1.WatchEntryR\awatches\"\xbb\x02\n" +
+	"\awatches\x18\x01 \x03(\v2\x16.kubewol.v1.WatchEntryR\awatches\"\xd7\x02\n" +
 	"\n" +
 	"WatchEntry\x12\x1c\n" +
 	"\tnamespace\x18\x01 \x01(\tR\tnamespace\x12\x18\n" +
@@ -343,7 +351,8 @@ const file_kubewol_v1_agent_proto_rawDesc = "" +
 	"proxy_mode\x18\b \x01(\bR\tproxyMode\x12!\n" +
 	"\frst_suppress\x18\t \x01(\bR\vrstSuppress\x12!\n" +
 	"\fdirect_scale\x18\n" +
-	" \x01(\bR\vdirectScale\"\x14\n" +
+	" \x01(\bR\vdirectScale\x12\x1a\n" +
+	"\bprotocol\x18\v \x01(\tR\bprotocol\"\x14\n" +
 	"\x12PutWatchesResponse\"\x12\n" +
 	"\x10SubscribeRequest\"j\n" +
 	"\bSynEvent\x12\x1c\n" +

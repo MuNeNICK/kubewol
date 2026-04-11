@@ -1,8 +1,8 @@
 # kubewol
 
-Wake-on-LAN for Kubernetes. eBPF detects TCP SYN and wakes scaled-to-zero workloads.
+Wake-on-LAN for Kubernetes. eBPF detects TCP SYN / UDP first packets and wakes scaled-to-zero workloads.
 
-kubewol is an eBPF-based traffic sensor and Prometheus-compatible metrics exporter that enables HPA scale-to-zero with TCP connection preservation. It requires the [HPA `HPAScaleToZero` feature gate](https://kubernetes.io/docs/reference/command-line-tools-reference/feature-gates/) (Alpha since v1.16, [improved in v1.36 with `ScaledToZero` condition](https://github.com/kubernetes/kubernetes/pull/135118)).
+kubewol is an eBPF-based traffic sensor and Prometheus-compatible metrics exporter that enables HPA scale-to-zero for TCP and UDP Services. TCP cold starts preserve the client connection via SYN retransmit; UDP support is trigger-only and depends on application-level retry if the first datagram must succeed. It requires the [HPA `HPAScaleToZero` feature gate](https://kubernetes.io/docs/reference/command-line-tools-reference/feature-gates/) (Alpha since v1.16, [improved in v1.36 with `ScaledToZero` condition](https://github.com/kubernetes/kubernetes/pull/135118)).
 
 ## How it works
 
@@ -64,12 +64,12 @@ kubectl annotate svc my-app kubewol/target-name=my-workload
 
 ### 2. Configure Prometheus Adapter
 
-Add a rule for `ebpf_service_syn_total` to your Prometheus Adapter config:
+Add a rule for `ebpf_service_packets_total` to your Prometheus Adapter config:
 
 ```yaml
 rules:
   external:
-    - seriesQuery: 'ebpf_service_syn_total'
+    - seriesQuery: 'ebpf_service_packets_total'
       resources:
         overrides:
           namespace: {resource: "namespace"}
@@ -97,7 +97,7 @@ spec:
     - type: External
       external:
         metric:
-          name: ebpf_service_syn_total
+          name: ebpf_service_packets_total
         target:
           type: Value
           value: "100m"
@@ -129,8 +129,8 @@ When no traffic arrives, HPA scales the Deployment to 0. When a TCP SYN is detec
 1. kubewol counts it and exposes via Prometheus `/metrics`
 2. Prometheus scrapes it (or kubewol pushes via Remote Write for speed)
 3. Prometheus Adapter exposes as external metric
-4. HPA sees `ebpf_service_syn_total > 0` and scales up
-5. The client's TCP connection is preserved through SYN retransmit
+4. HPA sees `ebpf_service_packets_total > 0` and scales up
+5. For TCP, the client's connection is preserved through SYN retransmit
 
 ## Annotations
 
@@ -216,7 +216,7 @@ kubectl label ns monitoring kubewol-metrics=scraper
 
 | Metric | Labels | Description |
 |---|---|---|
-| `ebpf_service_syn_total` | `namespace`, `service` | Cumulative TCP SYN count observed by eBPF. Used by HPA external metrics. |
+| `ebpf_service_packets_total` | `namespace`, `service` | Cumulative wake-triggering packet count observed by eBPF for watched Service ports. Used by HPA external metrics. |
 | `kubewol_bpf_drop_total` | `reason` | BPF hot-path failures (e.g. `syn_count_update` map full, `ringbuf_reserve` ring full). Non-zero means SYN events are being lost; scale up `max_entries` or scrape faster. |
 
 ## Fast cold start with Remote Write
@@ -245,7 +245,7 @@ kubewol agent DaemonSet (one per node, privileged only for BPF/TC)
   |                       to cover kube-proxy iptables propagation delay)
   |
   +-- HTTPS metrics (:8443/metrics)
-  |     ebpf_service_syn_total counter from BPF map
+  |     ebpf_service_packets_total counter from BPF map
   |
   +-- Remote Write push (optional)
   |     On SYN detection -> POST to remote_write endpoint
@@ -333,6 +333,7 @@ In HPA mode, the dominant bottleneck is the **HPA 15s sync period**. This is not
 ### Limitations
 
 - **IPv4 only.** The TC eBPF programs parse IPv4 headers only. IPv6 and dual-stack Services are explicitly skipped (logged as `skipping non-IPv4 service`).
+- **UDP is trigger-only.** Unlike TCP SYN, the first UDP datagram is dropped while the workload wakes; clients must retry at the application or protocol layer if that datagram matters.
 - **HPA evaluation frequency** is global, not per-HPA
 - **TCP SYN retransmit backoff** is kernel-level (1, 2, 4, 8, 16s intervals); after Pod is ready, the client waits for its next scheduled retransmit
 - **kube-proxy endpoint propagation** adds delay between Pod Ready and iptables/ipvs rule update

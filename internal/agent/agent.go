@@ -33,6 +33,7 @@ type WatchEntrySpec struct {
 	Service     string
 	TargetKind  string
 	TargetName  string
+	Protocol    string
 	ClusterIP   string
 	Port        uint16
 	NodePort    int32
@@ -60,9 +61,9 @@ type Agent struct {
 	// bpfKeyIndex maps from a BPF SvcKey back to the WatchEntrySpec so the
 	// ring-buffer reader can resolve SYN events to target workloads.
 	bpfKeyIndex map[bpf.SvcKey]*WatchEntrySpec
-	// nodePortIndex maps from a network-byte-order NodePort (padded to u32)
-	// back to the WatchEntrySpec for NodePort traffic.
-	nodePortIndex map[uint32]*WatchEntrySpec
+	// nodePortIndex maps from a protocol-aware NodePort key back to the
+	// WatchEntrySpec for NodePort traffic.
+	nodePortIndex map[bpf.NodePortKey]*WatchEntrySpec
 	// orphans holds BPF state that we failed to tear down during a
 	// previous ApplyWatches call. Each entry here is a best-effort
 	// retry target: at the top of every ApplyWatches we try to
@@ -93,13 +94,13 @@ func New(bpfMgr *bpf.Manager, logger logr.Logger) *Agent {
 		logger:        logger,
 		entries:       map[string]*entryState{},
 		bpfKeyIndex:   map[bpf.SvcKey]*WatchEntrySpec{},
-		nodePortIndex: map[uint32]*WatchEntrySpec{},
+		nodePortIndex: map[bpf.NodePortKey]*WatchEntrySpec{},
 		subs:          map[chan SynEvent]struct{}{},
 	}
 }
 
 func entryKey(e *WatchEntrySpec) string {
-	return fmt.Sprintf("%s/%s/%d", e.Namespace, e.Service, e.Port)
+	return fmt.Sprintf("%s/%s/%s/%d", e.Namespace, e.Service, e.Protocol, e.Port)
 }
 
 // installEntryLocked programs a single entryState into BPF. On any partial
@@ -109,7 +110,7 @@ func entryKey(e *WatchEntrySpec) string {
 // must hold a.mu.
 func (a *Agent) installEntryLocked(st *entryState) error {
 	rollbackRemove := func(reason error) error {
-		if rerr := a.bpf.RemoveWatch(st.ip, st.entry.Port, st.entry.NodePort); rerr != nil {
+		if rerr := a.bpf.RemoveWatch(st.ip, st.entry.Port, st.entry.NodePort, st.entry.Protocol); rerr != nil {
 			a.logger.Error(rerr, "rollback RemoveWatch failed; enqueueing orphan",
 				"key", entryKey(&st.entry), "installErr", reason)
 			a.orphans = append(a.orphans, &entryState{
@@ -120,7 +121,7 @@ func (a *Agent) installEntryLocked(st *entryState) error {
 		}
 		return reason
 	}
-	if _, err := a.bpf.AddWatch(st.ip, st.entry.Port, st.entry.NodePort); err != nil {
+	if _, err := a.bpf.AddWatch(st.ip, st.entry.Port, st.entry.NodePort, st.entry.Protocol); err != nil {
 		return fmt.Errorf("AddWatch: %w", err)
 	}
 	if err := a.bpf.SetProxyMode(st.key, st.entry.ProxyMode, st.entry.NodePort); err != nil {
@@ -137,7 +138,7 @@ func (a *Agent) installEntryLocked(st *entryState) error {
 // caller can either propagate (for the "phase 1 delete stale keys" loop)
 // or enqueue the entry as an orphan (for the "phase 2 swap" loop).
 func (a *Agent) uninstallEntryLocked(st *entryState) error {
-	return a.bpf.RemoveWatch(st.ip, st.entry.Port, st.entry.NodePort)
+	return a.bpf.RemoveWatch(st.ip, st.entry.Port, st.entry.NodePort, st.entry.Protocol)
 }
 
 // sweepOrphansLocked runs at the top of ApplyWatches and retries every
@@ -155,7 +156,7 @@ func (a *Agent) sweepOrphansLocked() {
 	}
 	kept := a.orphans[:0]
 	for _, o := range a.orphans {
-		if err := a.bpf.RemoveWatch(o.ip, o.entry.Port, o.entry.NodePort); err != nil {
+		if err := a.bpf.RemoveWatch(o.ip, o.entry.Port, o.entry.NodePort, o.entry.Protocol); err != nil {
 			a.logger.V(1).Info("orphan RemoveWatch still failing",
 				"key", entryKey(&o.entry), "error", err.Error())
 			kept = append(kept, o)
@@ -177,7 +178,7 @@ func (a *Agent) indexInsertLocked(st *entryState) {
 	entry := st.entry // stable pointer copy
 	a.bpfKeyIndex[st.key] = &entry
 	if st.entry.NodePort > 0 {
-		npKey := uint32(bpf.Htons(uint16(st.entry.NodePort)))
+		npKey := bpf.MakeNodePortKey(uint16(st.entry.NodePort), st.key.Proto)
 		a.nodePortIndex[npKey] = &entry
 	}
 }
@@ -185,7 +186,7 @@ func (a *Agent) indexInsertLocked(st *entryState) {
 func (a *Agent) indexRemoveLocked(st *entryState) {
 	delete(a.bpfKeyIndex, st.key)
 	if st.entry.NodePort > 0 {
-		npKey := uint32(bpf.Htons(uint16(st.entry.NodePort)))
+		npKey := bpf.MakeNodePortKey(uint16(st.entry.NodePort), st.key.Proto)
 		delete(a.nodePortIndex, npKey)
 	}
 }
@@ -227,7 +228,17 @@ func (a *Agent) ApplyWatches(specs []WatchEntrySpec) error {
 				"service", e.Namespace+"/"+e.Service, "ip", e.ClusterIP)
 			continue
 		}
-		bpfKey := bpf.SvcKey{Addr: bpf.IPToUint32Must(ip), Port: bpf.Htons(e.Port)}
+		proto, ok := bpf.ProtocolNumber(e.Protocol)
+		if !ok {
+			a.logger.V(1).Info("skip unsupported protocol",
+				"service", e.Namespace+"/"+e.Service, "protocol", e.Protocol)
+			continue
+		}
+		bpfKey := bpf.SvcKey{
+			Addr:  bpf.IPToUint32Must(ip),
+			Port:  bpf.Htons(e.Port),
+			Proto: proto,
+		}
 		want[entryKey(&e)] = &entryState{entry: e, key: bpfKey, ip: ip}
 	}
 
@@ -311,20 +322,20 @@ func (a *Agent) ApplyWatches(specs []WatchEntrySpec) error {
 }
 
 // lookupByBPFKey is invoked from the ring buffer reader to translate a BPF
-// event into a logical target workload. Returns nil if the SYN hit a service
+// event into a logical target workload. Returns nil if the packet hit a service
 // that does not want direct-scale.
-func (a *Agent) lookupByBPFKey(dstAddr uint32, dstPort uint16) *WatchEntrySpec {
+func (a *Agent) lookupByBPFKey(dstAddr uint32, dstPort uint16, proto uint8) *WatchEntrySpec {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 
-	if e, ok := a.bpfKeyIndex[bpf.SvcKey{Addr: dstAddr, Port: dstPort}]; ok {
+	if e, ok := a.bpfKeyIndex[bpf.SvcKey{Addr: dstAddr, Port: dstPort, Proto: proto}]; ok {
 		if !e.DirectScale {
 			return nil
 		}
 		cp := *e
 		return &cp
 	}
-	if e, ok := a.nodePortIndex[uint32(dstPort)]; ok {
+	if e, ok := a.nodePortIndex[bpf.MakeNodePortKey(bpf.Ntohs(dstPort), proto)]; ok {
 		if !e.DirectScale {
 			return nil
 		}
@@ -334,7 +345,7 @@ func (a *Agent) lookupByBPFKey(dstAddr uint32, dstPort uint16) *WatchEntrySpec {
 	return nil
 }
 
-// ServiceMetrics returns per-Service cumulative SYN count aggregated from the
+// ServiceMetrics returns per-Service cumulative wake-packet count aggregated from the
 // BPF syn_count map. Consumed by the /metrics exporter (still served over
 // HTTPS by controller-runtime's metrics server in agent mode).
 func (a *Agent) ServiceMetrics() []metrics.ServiceMetric {
@@ -346,7 +357,7 @@ func (a *Agent) ServiceMetrics() []metrics.ServiceMetric {
 	}
 	byKey := map[string]*agg{}
 	for _, st := range a.entries {
-		count, err := a.bpf.ReadSynCount(st.key)
+		count, err := a.bpf.ReadPacketCount(st.key)
 		if err != nil {
 			continue
 		}
@@ -397,12 +408,12 @@ func (a *Agent) emit(evt SynEvent) {
 		select {
 		case ch <- evt:
 		default:
-			a.logger.V(1).Info("dropping SYN event; subscriber backlog full")
+			a.logger.V(1).Info("dropping wake event; subscriber backlog full")
 		}
 	}
 }
 
-// RunRingBufReader consumes the BPF ring buffer, resolves each SYN to a
+// RunRingBufReader consumes the BPF ring buffer, resolves each packet to a
 // logical target via lookupByBPFKey, and emits a SynEvent for any match
 // that opted into direct-scale.
 func (a *Agent) RunRingBufReader(ctx context.Context, reader SynEventReader) {
@@ -421,7 +432,7 @@ func (a *Agent) RunRingBufReader(ctx context.Context, reader SynEventReader) {
 		if err != nil {
 			return
 		}
-		if entry := a.lookupByBPFKey(evt.DstAddr, evt.DstPort); entry != nil {
+		if entry := a.lookupByBPFKey(evt.DstAddr, evt.DstPort, evt.Proto); entry != nil {
 			a.emit(SynEvent{
 				Namespace:  entry.Namespace,
 				TargetKind: entry.TargetKind,

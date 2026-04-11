@@ -53,6 +53,7 @@ func (s *GRPCService) PutWatches(ctx context.Context, req *pb.WatchSpec) (*pb.Pu
 			Service:     w.GetService(),
 			TargetKind:  w.GetTargetKind(),
 			TargetName:  w.GetTargetName(),
+			Protocol:    w.GetProtocol(),
 			ClusterIP:   w.GetClusterIp(),
 			Port:        uint16(w.GetPort()),
 			NodePort:    w.GetNodePort(),

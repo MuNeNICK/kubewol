@@ -28,6 +28,9 @@ const (
 	wakeNamespace               = "wake-demo"
 	wakeDeploymentName          = "wake-app"
 	wakeClientPodName           = "wake-client"
+	udpWakeNamespace            = "udp-wake-demo"
+	udpWakeDeploymentName       = "udp-echo"
+	udpWakeClientPodName        = "udp-client"
 )
 
 func TestMain(m *testing.M) {
@@ -157,6 +160,71 @@ func TestE2ESmoke(t *testing.T) {
 	}
 }
 
+func TestE2EUDPWake(t *testing.T) {
+	cleanup(t)
+	t.Cleanup(func() { cleanup(t) })
+	t.Cleanup(func() {
+		if t.Failed() {
+			dumpDiagnostics(t)
+		}
+	})
+
+	runOrFail(t, exec.Command("make", "deploy", fmt.Sprintf("IMG=%s", projectImage)))
+
+	runOrFail(t, exec.Command("kubectl", "rollout", "status",
+		"deployment/"+controllerName, "-n", namespace, "--timeout=5m"))
+	runOrFail(t, exec.Command("kubectl", "rollout", "status",
+		"daemonset/"+agentName, "-n", namespace, "--timeout=5m"))
+
+	runOrFail(t, exec.Command("kubectl", "apply", "-f", "config/rbac/direct_scale_role.yaml"))
+	runOrFailInput(t, udpWakeWorkloadManifest(), exec.Command("kubectl", "apply", "-f", "-"))
+
+	runOrFail(t, exec.Command("kubectl", "run", udpWakeClientPodName,
+		"--namespace", udpWakeNamespace,
+		"--image=python:3.12-alpine",
+		"--restart=Never",
+		"--command", "--", "/bin/sh", "-c", "sleep 300"))
+
+	waitFor(t, 45*time.Second, "udp wake client ready", func() error {
+		out, err := run(exec.Command("kubectl", "get", "pod", udpWakeClientPodName,
+			"-n", udpWakeNamespace, "-o", "jsonpath={.status.phase}"))
+		if err != nil {
+			return err
+		}
+		if out != "Running" {
+			return fmt.Errorf("udp wake client pod phase=%q", out)
+		}
+		return nil
+	})
+
+	time.Sleep(3 * time.Second)
+
+	firstUDPAttempt := exec.Command("kubectl", "exec", "-n", udpWakeNamespace, udpWakeClientPodName,
+		"--", "python", "-c", udpClientScript("first"))
+	firstOutput, err := run(firstUDPAttempt)
+	if err == nil {
+		t.Fatalf("expected first UDP datagram to fail while triggering wake, output=%q", strings.TrimSpace(firstOutput))
+	}
+
+	waitFor(t, 45*time.Second, "udp direct-scale target deployment to scale to 1", func() error {
+		out, err := run(exec.Command("kubectl", "get", "deployment", udpWakeDeploymentName,
+			"-n", udpWakeNamespace, "-o", "jsonpath={.spec.replicas}:{.status.readyReplicas}"))
+		if err != nil {
+			return err
+		}
+		if out != "1:1" {
+			return fmt.Errorf("udp deployment replicas not ready yet: %q", out)
+		}
+		return nil
+	})
+
+	secondOutput := runOrFail(t, exec.Command("kubectl", "exec", "-n", udpWakeNamespace, udpWakeClientPodName,
+		"--", "python", "-c", udpClientScript("second")))
+	if !strings.Contains(secondOutput, "udp-ok:second") {
+		t.Fatalf("udp wake client did not receive expected response:\n%s", secondOutput)
+	}
+}
+
 func buildAndLoadImage() error {
 	if _, err := utils.Run(exec.Command("make", "docker-build", fmt.Sprintf("IMG=%s", projectImage))); err != nil {
 		return err
@@ -170,6 +238,7 @@ func cleanup(t *testing.T) {
 	runIgnore(exec.Command("kubectl", "delete", "clusterrolebinding", directScaleBindingName, "--ignore-not-found"))
 	runIgnore(exec.Command("kubectl", "delete", "pod", curlPodName, "-n", namespace, "--ignore-not-found"))
 	runIgnore(exec.Command("kubectl", "delete", "namespace", wakeNamespace, "--ignore-not-found"))
+	runIgnore(exec.Command("kubectl", "delete", "namespace", udpWakeNamespace, "--ignore-not-found"))
 	runIgnore(exec.Command("make", "undeploy", "ignore-not-found=true"))
 }
 
@@ -189,6 +258,9 @@ func dumpDiagnostics(t *testing.T) {
 	logCommand(t, "kubectl", "get", "all", "-n", wakeNamespace)
 	logCommand(t, "kubectl", "logs", wakeClientPodName, "-n", wakeNamespace)
 	logCommand(t, "kubectl", "get", "events", "-n", wakeNamespace, "--sort-by=.lastTimestamp")
+	logCommand(t, "kubectl", "get", "all", "-n", udpWakeNamespace)
+	logCommand(t, "kubectl", "logs", udpWakeClientPodName, "-n", udpWakeNamespace)
+	logCommand(t, "kubectl", "get", "events", "-n", udpWakeNamespace, "--sort-by=.lastTimestamp")
 }
 
 func getPods(t *testing.T, selector string) []string {
@@ -339,4 +411,72 @@ spec:
       port: 80
       targetPort: 8080
 `, wakeNamespace, wakeDeploymentName, wakeNamespace, wakeDeploymentName, wakeNamespace)
+}
+
+func udpWakeWorkloadManifest() string {
+	return fmt.Sprintf(`apiVersion: v1
+kind: Namespace
+metadata:
+  name: %s
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: %s
+  namespace: %s
+  labels:
+    app: udp-echo
+spec:
+  replicas: 0
+  selector:
+    matchLabels:
+      app: udp-echo
+  template:
+    metadata:
+      labels:
+        app: udp-echo
+    spec:
+      containers:
+        - name: udp-echo
+          image: python:3.12-alpine
+          command: ["python", "-c"]
+          args:
+            - |
+              import socket
+              sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+              sock.bind(("0.0.0.0", 9999))
+              while True:
+                  data, addr = sock.recvfrom(4096)
+                  sock.sendto(b"udp-ok:" + data, addr)
+          ports:
+            - containerPort: 9999
+              protocol: UDP
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: %s
+  namespace: %s
+  annotations:
+    kubewol/enabled: "true"
+    kubewol/direct-scale: "true"
+spec:
+  selector:
+    app: udp-echo
+  ports:
+    - name: udp
+      port: 9999
+      targetPort: 9999
+      protocol: UDP
+`, udpWakeNamespace, udpWakeDeploymentName, udpWakeNamespace, udpWakeDeploymentName, udpWakeNamespace)
+}
+
+func udpClientScript(payload string) string {
+	return fmt.Sprintf(`import socket
+sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+sock.settimeout(1)
+sock.sendto(%q.encode(), ("%s.%s.svc.cluster.local", 9999))
+data, _ = sock.recvfrom(4096)
+print(data.decode())
+`, payload, udpWakeDeploymentName, udpWakeNamespace)
 }

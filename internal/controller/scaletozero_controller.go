@@ -74,6 +74,7 @@ type WatchEntry struct {
 	Service     string
 	TargetKind  string
 	TargetName  string
+	Protocol    string
 	ClusterIP   net.IP
 	Port        uint16
 	NodePort    int32
@@ -159,10 +160,18 @@ func (r *ScaleToZeroReconciler) parseService(ctx context.Context, svc *corev1.Se
 
 	ports := make([]portSpec, 0, len(svc.Spec.Ports))
 	for _, p := range svc.Spec.Ports {
-		if p.Protocol != corev1.ProtocolTCP && p.Protocol != "" {
+		proto := p.Protocol
+		if proto == "" {
+			proto = corev1.ProtocolTCP
+		}
+		if proto != corev1.ProtocolTCP && proto != corev1.ProtocolUDP {
 			continue
 		}
-		ports = append(ports, portSpec{port: uint16(p.Port), nodePort: p.NodePort})
+		ports = append(ports, portSpec{
+			protocol: string(proto),
+			port:     uint16(p.Port),
+			nodePort: p.NodePort,
+		})
 	}
 	if len(ports) == 0 {
 		return nil, nil
@@ -205,6 +214,7 @@ func (r *ScaleToZeroReconciler) buildEntries(svc *corev1.Service, ps *parsedServ
 			Service:     svc.Name,
 			TargetKind:  ps.targetKind,
 			TargetName:  ps.targetName,
+			Protocol:    p.protocol,
 			ClusterIP:   ps.ip,
 			Port:        p.port,
 			NodePort:    p.nodePort,
@@ -258,6 +268,7 @@ func (r *ScaleToZeroReconciler) buildSpec() *pb.WatchSpec {
 				Service:     e.Service,
 				TargetKind:  e.TargetKind,
 				TargetName:  e.TargetName,
+				Protocol:    e.Protocol,
 				ClusterIp:   e.ClusterIP.String(),
 				Port:        uint32(e.Port),
 				NodePort:    e.NodePort,
@@ -355,6 +366,7 @@ func (r *ScaleToZeroReconciler) detectTarget(ctx context.Context, ns, name strin
 }
 
 type portSpec struct {
+	protocol string
 	port     uint16
 	nodePort int32
 }

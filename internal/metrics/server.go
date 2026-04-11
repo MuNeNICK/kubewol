@@ -1,5 +1,5 @@
 // Package metrics provides a Prometheus exporter and Remote Write pusher
-// for eBPF SYN count metrics.
+// for eBPF wake-packet metrics.
 package metrics
 
 import (
@@ -16,7 +16,7 @@ import (
 	"github.com/prometheus/client_golang/prometheus"
 )
 
-// ServiceMetric holds the current SYN count for a service.
+// ServiceMetric holds the current wake-packet count for a service.
 type ServiceMetric struct {
 	Namespace string
 	Service   string
@@ -55,8 +55,8 @@ func NewExporter(provider Provider, dropProvider DropProvider, remoteWriteURL st
 		dropProvider:   dropProvider,
 		remoteWriteURL: remoteWriteURL,
 		desc: prometheus.NewDesc(
-			"ebpf_service_syn_total",
-			"TCP SYN packets observed by eBPF for a Kubernetes service",
+			"ebpf_service_packets_total",
+			"Wake-triggering packets observed by eBPF for a Kubernetes service",
 			[]string{"namespace", "service"}, nil,
 		),
 		dropDesc: prometheus.NewDesc(
@@ -102,7 +102,7 @@ func (e *Exporter) Collect(ch chan<- prometheus.Metric) {
 }
 
 // PushRemoteWrite sends current metrics to Prometheus via Remote Write.
-// Call on SYN detection for fast metric delivery (bypasses scrape interval).
+// Call on packet detection for fast metric delivery (bypasses scrape interval).
 func (e *Exporter) PushRemoteWrite() error {
 	if e.remoteWriteURL == "" {
 		return nil
@@ -161,7 +161,7 @@ func encodeTimeSeries(m ServiceMetric, ts int64) []byte {
 	var buf bytes.Buffer
 	// labels
 	for _, lbl := range [][2]string{
-		{"__name__", "ebpf_service_syn_total"},
+		{"__name__", "ebpf_service_packets_total"},
 		{"namespace", m.Namespace},
 		{"service", m.Service},
 	} {
