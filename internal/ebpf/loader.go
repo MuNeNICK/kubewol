@@ -15,6 +15,7 @@ import (
 
 	"github.com/cilium/ebpf"
 	"github.com/cilium/ebpf/link"
+	"github.com/fsnotify/fsnotify"
 	"github.com/go-logr/logr"
 )
 
@@ -283,18 +284,54 @@ func (m *Manager) attachNewInterfaces() (int, error) {
 	return attached, nil
 }
 
-// WatchInterfaces polls for new interfaces and attaches TC programs to them.
-// Run this as a goroutine for the lifetime of the process.
-//
-// Polling is used instead of netlink RTM_NEWLINK because a 1s poll is cheap
-// (one getifaddrs syscall) and avoids a new dependency. A newly-created Pod's
-// RST-suppression coverage gap is at most one poll interval, which is well
-// below the kernel's ~1s first TCP SYN retransmit, so the client still sees
-// a transparent cold start as long as the attach happens within that window.
+// WatchInterfaces watches /sys/class/net for interface churn and attaches TC
+// programs to new interfaces immediately. A low-frequency safety scan remains
+// in place to cover missed fsnotify events or unusual sysfs behavior.
 func (m *Manager) WatchInterfaces(ctx context.Context, interval time.Duration) {
 	if interval <= 0 {
-		interval = time.Second
+		interval = 30 * time.Second
 	}
+
+	watcher, err := fsnotify.NewWatcher()
+	if err != nil {
+		m.logger.Info("interface watcher unavailable; falling back to polling", "error", err.Error())
+		m.watchInterfacesPoll(ctx, interval)
+		return
+	}
+	defer func() { _ = watcher.Close() }()
+
+	if err := watcher.Add("/sys/class/net"); err != nil {
+		m.logger.Info("interface watcher add failed; falling back to polling",
+			"path", "/sys/class/net", "error", err.Error())
+		m.watchInterfacesPoll(ctx, interval)
+		return
+	}
+
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case evt := <-watcher.Events:
+			if evt.Has(fsnotify.Create) || evt.Has(fsnotify.Remove) || evt.Has(fsnotify.Rename) {
+				if _, err := m.attachNewInterfaces(); err != nil {
+					m.logger.V(1).Info("dynamic attach scan failed", "error", err.Error())
+				}
+			}
+		case err := <-watcher.Errors:
+			if err != nil {
+				m.logger.V(1).Info("interface watcher error", "error", err.Error())
+			}
+		case <-ticker.C:
+			if _, err := m.attachNewInterfaces(); err != nil {
+				m.logger.V(1).Info("dynamic attach scan failed", "error", err.Error())
+			}
+		}
+	}
+}
+
+func (m *Manager) watchInterfacesPoll(ctx context.Context, interval time.Duration) {
 	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
 	for {

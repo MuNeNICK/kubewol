@@ -225,8 +225,9 @@ func runAgent(probeAddr, metricsAddr, remoteWriteURL, ifaceAllow, ifaceDeny stri
 		setupLog.Error(err, "agent subsystem terminated; marking readyz unhealthy")
 	}
 
-	// Dynamic TC attach for veth pairs created after startup.
-	go bpfMgr.WatchInterfaces(ctx, time.Second)
+	// Dynamic TC attach for veth pairs created after startup. Event-driven sysfs
+	// watch is primary; the interval is only a low-frequency safety rescan.
+	go bpfMgr.WatchInterfaces(ctx, 30*time.Second)
 
 	// Ring buffer → gRPC SubscribeSynEvents stream fanout. Exit of this
 	// goroutine means the direct-scale fast path is dead; flip readyz so
