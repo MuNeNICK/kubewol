@@ -323,10 +323,16 @@ func runController(
 	// so the reconcile loop has a push target from the very first event. The
 	// direct-scale handler is late-bound because it depends on the reconciler
 	// itself, which we are building right now.
+	controllerMetrics, err := controller.NewMetrics(ctrlmetrics.Registry)
+	if err != nil {
+		setupLog.Error(err, "unable to register controller metrics")
+		os.Exit(1)
+	}
 	reconciler := &controller.ScaleToZeroReconciler{
 		Client:    mgr.GetClient(),
 		APIReader: mgr.GetAPIReader(),
 		Scheme:    mgr.GetScheme(),
+		Metrics:   controllerMetrics,
 	}
 
 	// Bounded worker pool for direct-scale triggers. Each worker uses the
@@ -377,6 +383,7 @@ func runController(
 		agentNamespace, agentService, agentPort,
 		handleSyn,
 		tls,
+		controllerMetrics,
 	)
 	reconciler.Fleet = fleet
 

@@ -47,6 +47,7 @@ type Fleet struct {
 	port       int    // agent gRPC port
 	onEvent    SynEventHandler
 	tls        FleetOptions
+	metrics    *Metrics
 
 	mu      sync.Mutex
 	clients map[string]*agentClient // keyed by "ip:port"
@@ -66,7 +67,7 @@ type agentClient struct {
 // NewFleet constructs a Fleet. namespace is the namespace the agent DaemonSet
 // runs in; serviceKey is the headless Service name; port is the agent gRPC
 // port (typically 8444); tls configures optional peer verification.
-func NewFleet(k8s client.Client, logger logr.Logger, namespace, serviceKey string, port int, onEvent SynEventHandler, tls FleetOptions) *Fleet {
+func NewFleet(k8s client.Client, logger logr.Logger, namespace, serviceKey string, port int, onEvent SynEventHandler, tls FleetOptions, metrics *Metrics) *Fleet {
 	return &Fleet{
 		k8s:        k8s,
 		logger:     logger.WithName("fleet"),
@@ -75,6 +76,7 @@ func NewFleet(k8s client.Client, logger logr.Logger, namespace, serviceKey strin
 		port:       port,
 		onEvent:    onEvent,
 		tls:        tls,
+		metrics:    metrics,
 		clients:    map[string]*agentClient{},
 	}
 }
@@ -221,7 +223,9 @@ func (f *Fleet) refresh(ctx context.Context) error {
 		f.logger.Info("agent dropped", "target", ac.target)
 	}
 	snapshot := f.lastSpec
+	clientCount := len(f.clients)
 	f.mu.Unlock()
+	f.metrics.SetAgentClients(clientCount)
 
 	// Backfill any brand-new agents with the most recent WatchSpec so a
 	// restarted DaemonSet pod does not sit with empty BPF state until the
@@ -293,6 +297,7 @@ func (f *Fleet) PushAll(ctx context.Context, spec *pb.WatchSpec) error {
 
 	if len(targets) == 0 {
 		f.logger.V(1).Info("PushAll: no agents yet")
+		f.metrics.ObserveWatchPush("no_agents")
 		// No agents to push to, but the caller asked for this spec so
 		// cache it — the next agent that joins should converge on it.
 		f.mu.Lock()
@@ -331,6 +336,9 @@ func (f *Fleet) PushAll(ctx context.Context, spec *pb.WatchSpec) error {
 		f.mu.Lock()
 		f.lastSpec = spec
 		f.mu.Unlock()
+		f.metrics.ObserveWatchPush("success")
+	} else {
+		f.metrics.ObserveWatchPush("error")
 	}
 	return errors.Join(errs...)
 }
@@ -343,4 +351,5 @@ func (f *Fleet) closeAll() {
 		_ = ac.client.Close()
 	}
 	f.clients = map[string]*agentClient{}
+	f.metrics.SetAgentClients(0)
 }

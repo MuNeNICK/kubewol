@@ -103,6 +103,7 @@ type ScaleToZeroReconciler struct {
 	APIReader client.Reader
 	Scheme    *runtime.Scheme
 	Fleet     AgentFleet
+	Metrics   *Metrics
 
 	mu sync.RWMutex
 	// watches is the per-Service desired state. Aggregated across all Services
@@ -431,6 +432,7 @@ func (r *ScaleToZeroReconciler) TriggerScale(ctx context.Context, namespace, kin
 	r.pruneInflightLocked()
 	if last, ok := r.scaleInflight[key]; ok && time.Since(last) < scaleDebounce {
 		r.scaleMu.Unlock()
+		r.Metrics.ObserveDirectScale("debounced", kind, 0)
 		return
 	}
 	r.scaleInflight[key] = time.Now()
@@ -465,14 +467,17 @@ func (r *ScaleToZeroReconciler) TriggerScale(ctx context.Context, namespace, kin
 
 	if err != nil {
 		logger.Error(err, "direct-scale failed", "target", key)
+		r.Metrics.ObserveDirectScale("error", kind, time.Since(start))
 		r.clearInflight(key)
 		return
 	}
 	if alreadyScaled {
 		logger.V(1).Info("skipping direct-scale; already scaled", "target", key)
+		r.Metrics.ObserveDirectScale("already_scaled", kind, time.Since(start))
 		return
 	}
 	logger.Info("scaled 0->1", "target", key, "duration", time.Since(start))
+	r.Metrics.ObserveDirectScale("success", kind, time.Since(start))
 }
 
 // pruneInflightLocked drops scaleInflight entries older than scaleInflightGC.
